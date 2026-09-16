@@ -151,12 +151,11 @@ def _safe_topup_url(candidate: object, token: str) -> str | None:
     # Returned as re-composed parts rather than as the input string, so what is
     # quoted is provably what was validated. `urlsplit` silently drops tab and
     # newline characters before parsing, which would otherwise let an input pass
-    # the checks in one spelling and reach the message in another. The whitespace
-    # guard above already rejects exactly those inputs, so `return candidate`
-    # here is an **equivalent mutant** -- measured, no input distinguishes the
-    # two -- and a mutation run will report it forever. It is kept because it
-    # makes the property structural instead of a consequence of two checks
-    # staying in agreement; do not add a case trying to kill it.
+    # the checks in one spelling and reach the message in another; the whitespace
+    # guard above rejects those, and this makes the property structural rather
+    # than a consequence of two checks staying in agreement. Re-composition is
+    # observable in its own right -- an empty `?` or `#` delimiter is dropped --
+    # so `test_a_quoted_link_is_the_recomposed_parse_not_the_input` pins it.
     return urlunsplit(parts)
 
 

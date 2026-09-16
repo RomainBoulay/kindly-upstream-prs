@@ -140,6 +140,9 @@ async def run_402(body: Any) -> ApifarePaymentRequiredError:
     with pytest.raises(ApifarePaymentRequiredError) as raised:
         await run_search(body, status=402)
 
+    # Exact class, not the base: every table below inherits this helper, and a
+    # future subclass would otherwise satisfy them all without being noticed.
+    assert type(raised.value) is ApifarePaymentRequiredError
     return raised.value
 
 
@@ -413,6 +416,27 @@ async def test_quotes_a_top_up_url_on_the_allowed_host(url: str, configured: Non
         configured: Fixture providing the dummy credential.
     """
     assert url in str(await run_402({"topup_url": url}))
+
+
+async def test_a_quoted_link_is_the_recomposed_parse_not_the_input(
+    configured: None,
+) -> None:
+    """Quote what was validated, not the string that was handed in
+
+    ``_safe_topup_url`` returns ``urlunsplit(urlsplit(x))`` so the two can never
+    diverge. That is observable: an empty ``?`` or ``#`` delimiter is dropped by
+    the round trip. Without this case, replacing the re-composition with
+    ``return candidate`` passes every other row here -- which is exactly the
+    mistake that produced a comment in ``apifare.py`` claiming the two were
+    indistinguishable.
+
+    Args:
+        configured: Fixture providing the dummy credential.
+    """
+    message = str(await run_402({"topup_url": "https://apifare.com/balance#"}))
+
+    assert "https://apifare.com/balance" in message
+    assert "https://apifare.com/balance#" not in message
 
 
 @pytest.mark.parametrize(

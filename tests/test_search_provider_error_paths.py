@@ -3,7 +3,7 @@
 One module rather than one per provider because the five failures pinned here -- ``401``,
 ``429``, a non-JSON body, a well-formed JSON body of the wrong shape, and a
 timeout -- are identical in shape across every provider. Splitting per provider
-would copy the :class:`httpx.MockTransport` helper once per provider and let them
+would copy the :class:`httpx.MockTransport` helper once per provider and let those
 copies drift.
 
 **What this module does and does not own.** It owns the contract every provider
@@ -281,7 +281,7 @@ async def test_a_non_json_body_is_reported_as_the_providers_own_error(
     returns.
 
     The mutation this kills differs by provider, and the difference is measured.
-    For six of them, removing the ``except ValueError`` arm lets a raw
+    For every provider but SearXNG, removing the ``except ValueError`` arm lets a raw
     ``json.JSONDecodeError`` escape, and the class assertion alone fails the
     case. For SearXNG it does **not** escape: the per-instance loop catches it and
     re-raises the aggregate, which is still a ``SearxngError``. There, only the
@@ -338,13 +338,13 @@ async def test_a_transport_timeout_reaches_the_caller(
     """Surface a timeout rather than converting it into "no matches"
 
     SearXNG has a branch here -- its per-instance loop catches every exception --
-    and removing it fails this case. **The other six providers have no branch to
+    and removing it fails this case. **No other provider has a branch to
     remove**, so for them this is a regression guard rather than a mutation
     target: it fails the day someone wraps the request in
     ``except Exception: return []``, which would turn an operator-visible timeout
     into an empty result set indistinguishable from a query with no hits. Stated
     rather than left implicit, because a mutation run will report nothing for
-    those six rows and the next reader would otherwise read that as a hole.
+    those rows and the next reader would otherwise read that as a hole.
 
     The timeout is injected, so this pins **propagation**, not **arming**. Whether
     a provider sets a deadline at all is a separate claim, and for SearXNG --

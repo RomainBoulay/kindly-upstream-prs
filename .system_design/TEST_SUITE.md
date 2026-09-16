@@ -373,7 +373,7 @@ arbitrary:
 already had a key keeps its provider — `test_search_router.py::test_prefers_serply_over_apifare_when_both_keys`
 pins the adjacent pair. It follows the E5-8 layout: `tests/test_apifare_unit.py`
 for the request and the parsing, written pytest-first, plus a row in the shared
-error-path table and a row in the credential-disclosure sweep. Four choices in
+error-path table and a row in the credential-disclosure sweep. Five choices in
 the module would otherwise look arbitrary:
 
 - **It is configured by a bearer token, not a per-vendor API key**, because
@@ -399,6 +399,13 @@ the module would otherwise look arbitrary:
   redundant with the host rule: a URL on the genuine host can carry the token in
   its query string, and the first draft of this validator did exactly that until
   `test_the_402_message_never_carries_the_bearer_token` caught it.
+- **A missing or non-string `description` keeps the result**, where the version
+  contributed in PR #95 dropped it, as `serper.py` still does. Forced by the
+  choice above: with a "none of the returned results could be parsed" guard in
+  place, requiring a snippet would turn a live response whose results simply have
+  no snippet into an `ApifareError` — the exact false alarm that guard exists to
+  avoid. `serply.py` already keeps such a result, and `page_content` is fetched
+  later anyway.
 - **An absent `results` key returns `[]`; a `results` key of the wrong type
   raises.** The rule file's "empty results are a valid answer, not an error"
   governs the first, and for an API whose envelope nobody has confirmed, omitting

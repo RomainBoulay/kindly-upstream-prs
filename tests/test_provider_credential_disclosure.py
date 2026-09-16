@@ -28,7 +28,7 @@ parameter name nobody listed. Stripping parameters named ``api_key``, ``key`` or
 it. Dropping the URL has no such gap, and needs no pattern to be kept current.
 
 **What makes the provider sweep non-vacuous.** Only SerpBase disclosed on the
-unrepaired tree; the other six already passed, so on their own they are
+unrepaired tree; the rest already passed, so on their own they are
 regression cover and not evidence. Pointed at a header-authenticating provider,
 a "the secret is absent" assertion passes while proving nothing. So a **sibling
 case** asserts, once per provider, that the credential was genuinely *in flight*
@@ -777,8 +777,8 @@ def test_the_httpx_error_family_has_the_shape_the_conversion_assumes(
 def test_invalid_url_carries_no_request_to_read_a_url_from() -> None:
     """The one outside the family that a configuration-derived URL can reach.
 
-    SearXNG builds its URL from ``SEARXNG_BASE_URL``, so unlike the six
-    fixed-host providers it can raise ``InvalidURL`` from configuration alone --
+    SearXNG builds its URL from ``SEARXNG_BASE_URL``, so unlike every
+    fixed-host provider it can raise ``InvalidURL`` from configuration alone --
     and being outside the family, the router never sees it. (SerpBase and Serply
     reach it only through an over-long query, covered by the case below.) What keeps that harmless is asserted here:
     the exception carries no ``request``, so there is no URL on it for anything
@@ -902,7 +902,9 @@ async def test_an_apifare_402_reaches_the_client_without_the_token_or_foreign_te
     the only place in any provider where a string chosen by the remote end is
     quoted into a message this server serves. The body here is what a
     compromised endpoint would send: the bearer token echoed back, and a top-up
-    link pointing somewhere else.
+    link pointing somewhere else. That body trips the host rule and the token
+    rule together, deliberately -- isolating one rule per case is the unit
+    module's job, and this case's job is the boundary.
 
     Args:
         monkeypatch: pytest's environment patcher.

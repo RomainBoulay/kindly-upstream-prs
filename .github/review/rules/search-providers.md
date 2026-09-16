@@ -64,7 +64,7 @@ Every provider module must:
 3. Let an `httpx.HTTPError` reach the router, which converts it. **This rule
    used to say the opposite** — that an `httpx` exception escaping to the router
    was a finding — and it described something that never existed: no provider
-   raises `WebSearchProviderError`, and six of the seven call `raise_for_status()`
+   raises `WebSearchProviderError`, and every provider but SearXNG calls `raise_for_status()`
    and let httpx's exception out. The router is now the enforcement point.
    `search_web` catches the whole `httpx.HTTPError` family and re-raises
    `SearchProviderTransportError`, whose message is built from the provider's
