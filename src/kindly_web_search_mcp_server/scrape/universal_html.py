@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -18,6 +19,7 @@ from .worker_runner import (
     _remove_worker_profile_directory,
     _run_pipe_probe,
     _run_worker_command,
+    _worker_was_killed,
 )
 from ..utils.diagnostics import (
     Diagnostics,
@@ -265,6 +267,10 @@ async def fetch_html_via_nodriver(
     # it on every path -- including one that raises between the acquisition and
     # the assignment below.
     unpooled_user_data_dir: str | None = None
+    # Set when the worker was *killed* rather than allowed to exit, which means
+    # its own `_cleanup` never ran and the pooled browser still holds the page it
+    # was navigating. See `.system_design/SYSTEM_DESIGN.md` §1.4.
+    worker_was_killed = False
     # The acquisition sits inside the try whose `finally` returns the slot,
     # rather than before it. A slot acquired and then abandoned by a raise is
     # never queued again, and repeated occurrences starve the pool down to the
@@ -405,13 +411,43 @@ async def fetch_html_via_nodriver(
             )
             return any(pattern in message for pattern in patterns)
 
+        async def _run_worker_noting_kills(active_cmd: list[str]) -> str:
+            """Run the worker, noting a kill that leaves the pooled tab open.
+
+            Wraps *both* worker runs rather than only the first. The restart path
+            below runs the worker a second time, and that run can time out too;
+            a flag set at one call site would leave the replacement slot dirty --
+            the same defect, one retry later.
+
+            Args:
+                active_cmd: The worker argv to run.
+
+            Returns:
+                The worker's stdout, as `_run_worker_command` returns it.
+
+            Raises:
+                BaseException: Whatever the run raised, unchanged. The kill is
+                    recorded on the way past, so the caller still sees the
+                    failure it needs rather than a report about the browser.
+            """
+            nonlocal worker_was_killed
+            try:
+                return await _run_worker_command(
+                    active_cmd,
+                    env=env,
+                    default_timeout_seconds=config.total_timeout_seconds,
+                    diagnostics=diagnostics,
+                )
+            # `BaseException`, because a cancellation is one and is half of what
+            # this exists to catch. The runner classifies it: this module is held
+            # to importing no process primitives, so it cannot name the types.
+            except BaseException as exc:
+                if _worker_was_killed(exc):
+                    worker_was_killed = True
+                raise
+
         try:
-            return await _run_worker_command(
-                cmd,
-                env=env,
-                default_timeout_seconds=config.total_timeout_seconds,
-                diagnostics=diagnostics,
-            )
+            return await _run_worker_noting_kills(cmd)
         except Exception as exc:
             if slot is None or pool is None:
                 raise
@@ -463,14 +499,22 @@ async def fetch_html_via_nodriver(
                 browser_executable_path=browser_executable_path,
             )
             _emit_worker_spawn(cmd)
-            return await _run_worker_command(
-                cmd,
-                env=env,
-                default_timeout_seconds=config.total_timeout_seconds,
-                diagnostics=diagnostics,
-            )
+            return await _run_worker_noting_kills(cmd)
     finally:
         if slot is not None and pool is not None:
+            # Terminate *before* the release: released first, the queue can hand
+            # the dirty browser to a waiting caller before the terminate lands.
+            if worker_was_killed:
+                if diagnostics:
+                    diagnostics.emit(
+                        "pool.slot_recycled",
+                        "Recycling pooled Chromium after a killed worker",
+                        {"slot_id": slot.slot_id},
+                    )
+                # Suppressed because this is a `finally`: a raise here would
+                # replace the timeout the caller actually needs to see.
+                with contextlib.suppress(Exception):
+                    await slot.terminate()
             await pool.release(slot, diagnostics=diagnostics)
         # A sibling of the release, never inside it. Nested under the pooled
         # branch this would run only for pooled runs -- the one case that must

@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -138,6 +138,85 @@ def _run_call(mock_run: AsyncMock) -> tuple[list[str], dict[str, object]]:
     call = mock_run.call_args
     assert call is not None, "the worker runner was never called"
     return call.args[0], call.kwargs
+
+
+@contextlib.contextmanager
+def pooled_doubles(
+    *,
+    slots: list[Any],
+    run: Any,
+    terminate_error: BaseException | None = None,
+) -> Iterator[SimpleNamespace]:
+    """Double the pool and the runner for one pooled `fetch_html_via_nodriver`.
+
+    The five-patch block this replaces is spelled out inline in the pool cases
+    written before it, and is left that way: each of those asserts something
+    about the command *builder* as well, so the block is part of what they say.
+    The cases below assert only which pool calls happened and in what order, and
+    six copies of the same block would bury that.
+
+    Slot ``terminate`` is replaced per slot rather than doubled on the pool,
+    because it is a `ChromiumSlot` method and the pool never calls it — the
+    parent does. `ChromiumSlot` is an unfrozen dataclass, so the attribute takes
+    an :class:`AsyncMock` directly.
+
+    **Order is recorded, not just counted.** ``terminate`` and ``release`` are
+    attached to one parent mock, the technique
+    :mod:`tests.test_nodriver_worker_sandbox` records: two await counts cannot
+    distinguish "terminated, then released" from "released, then terminated", and
+    only the second hands a live browser back to the queue.
+
+    Args:
+        slots: Slots ``pool.acquire`` hands out, in order. Each one's
+            ``terminate`` is replaced with a recording double.
+        run: ``side_effect`` for the `_run_worker_command` double — a list of
+            results and exceptions, one per expected run.
+        terminate_error: Raised by every slot's ``terminate``, for the case that
+            asserts a failing terminate masks nothing.
+
+    Yields:
+        The doubles, as ``pool``, ``recorder``, ``builder`` and ``runner``.
+    """
+    pool = AsyncMock()
+    pool.acquire.side_effect = list(slots)
+    recorder = MagicMock()
+    for slot in slots:
+        slot.terminate = AsyncMock(side_effect=terminate_error)
+        recorder.attach_mock(slot.terminate, f"terminate_{slot.slot_id}")
+    recorder.attach_mock(pool.release, "release")
+
+    with (
+        pinned_environment(KINDLY_NODRIVER_REUSE_BROWSER="1"),
+        patch(
+            "kindly_web_search_mcp_server.scrape.universal_html.get_chromium_pool",
+            new_callable=AsyncMock,
+            return_value=pool,
+        ),
+        patch(
+            "kindly_web_search_mcp_server.scrape.universal_html._build_worker_command",
+            return_value=["worker-command"],
+        ) as builder,
+        patch(
+            "kindly_web_search_mcp_server.scrape.universal_html._run_worker_command",
+            new_callable=AsyncMock,
+            side_effect=run,
+        ) as runner,
+    ):
+        yield SimpleNamespace(
+            pool=pool, recorder=recorder, builder=builder, runner=runner
+        )
+
+
+def recorded_pool_calls(recorder: MagicMock) -> list[str]:
+    """Return the terminate and release calls a recorder saw, in order.
+
+    Args:
+        recorder: The parent mock :func:`pooled_doubles` attached them to.
+
+    Returns:
+        One name per call, in the order they happened.
+    """
+    return [call[0] for call in recorder.mock_calls]
 
 
 class TestUniversalHtmlLoader(unittest.IsolatedAsyncioTestCase):
@@ -616,6 +695,277 @@ class TestUniversalHtmlLoader(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_run.await_count, 1)
         self.assertEqual(pool.release.await_count, 1)
 
+    async def test_a_timed_out_pooled_worker_hands_back_a_terminated_slot(
+        self,
+    ) -> None:
+        """Do not hand the next caller a browser still holding the last page
+
+        A timeout is the one failure where the worker does **not** get to clean
+        up: `_run_worker_command` kills the whole process tree, so `_fetch_html`'s
+        `_cleanup` never runs and the tab it navigated survives in the pooled
+        browser. The slot is dirty by construction.
+
+        Nothing caught it. `asyncio.TimeoutError` carries an empty message, so
+        `_exception_message_chain` yields `""` and `_pool_error_requires_restart`
+        matches none of its eight patterns — a classifier written entirely around
+        message text cannot see a failure that has no message. The `finally` then
+        released the slot untouched, and the next request took that tab as
+        `page_targets[0]` and navigated it, inheriting the previous request's
+        live document, its timers and its in-flight requests. With a pool of one
+        and a page that blocks `Page.navigate`, the next request times out too
+        and the slot never recovers.
+
+        `terminate` clears the slot's `proc`, and `ensure_started` relaunches a
+        slot whose `proc` is `None`, so terminating before the release is what
+        makes the *next* acquirer's browser a clean one.
+        """
+        from kindly_web_search_mcp_server.scrape.chromium_pool import ChromiumSlot
+        from kindly_web_search_mcp_server.scrape.universal_html import (
+            fetch_html_via_nodriver,
+        )
+
+        slot = ChromiumSlot(slot_id=11, host="127.0.0.11", port=9451)
+
+        with pooled_doubles(slots=[slot], run=[asyncio.TimeoutError()]) as doubles:
+            with self.assertRaises(asyncio.TimeoutError):
+                await fetch_html_via_nodriver("https://example.com")
+
+        self.assertEqual(slot.terminate.await_count, 1)
+        self.assertEqual(
+            [call.args[0] for call in doubles.pool.release.await_args_list], [slot]
+        )
+        # The order is the whole claim: released first, the queue can hand the
+        # dirty browser to a waiting caller before the terminate lands.
+        self.assertEqual(
+            recorded_pool_calls(doubles.recorder), ["terminate_11", "release"]
+        )
+
+    async def test_a_cancelled_pooled_worker_hands_back_a_terminated_slot(
+        self,
+    ) -> None:
+        """Treat a cancelled worker as the killed worker it is
+
+        `_run_worker_command` kills the process tree for `CancelledError` exactly
+        as it does for a timeout, so the slot is left dirty in the same way. The
+        route there is different and worth pinning separately: `CancelledError`
+        derives from `BaseException`, so `except Exception` never sees it and the
+        restart classifier is not merely unable to match it — it is never
+        consulted at all. A fix written only against `TimeoutError` would leave
+        this half open, and a fix written inside `except Exception` would leave
+        it open regardless of how the classifier changed.
+        """
+        from kindly_web_search_mcp_server.scrape.chromium_pool import ChromiumSlot
+        from kindly_web_search_mcp_server.scrape.universal_html import (
+            fetch_html_via_nodriver,
+        )
+
+        slot = ChromiumSlot(slot_id=12, host="127.0.0.12", port=9452)
+
+        with pooled_doubles(slots=[slot], run=[asyncio.CancelledError()]) as doubles:
+            with self.assertRaises(asyncio.CancelledError):
+                await fetch_html_via_nodriver("https://example.com")
+
+        self.assertEqual(
+            recorded_pool_calls(doubles.recorder), ["terminate_12", "release"]
+        )
+
+    async def test_a_timed_out_pooled_worker_is_not_retried(self) -> None:
+        """Recover the browser for the next request, not this one
+
+        The obvious repair — adding the timeout to
+        `_pool_error_requires_restart` — would also re-run the worker under a
+        fresh full `total_timeout_seconds`, turning one hung fetch into two and
+        doubling the worst case the caller is already waiting through. The
+        budget that expired is the caller's; spending it twice is not recovery.
+
+        So this case pins the polarity the terminate cases cannot see: exactly
+        one run, one command built, and the caller's own `TimeoutError`.
+        """
+        from kindly_web_search_mcp_server.scrape.chromium_pool import ChromiumSlot
+        from kindly_web_search_mcp_server.scrape.universal_html import (
+            fetch_html_via_nodriver,
+        )
+
+        slot = ChromiumSlot(slot_id=13, host="127.0.0.13", port=9453)
+
+        with pooled_doubles(slots=[slot], run=[asyncio.TimeoutError()]) as doubles:
+            with self.assertRaises(asyncio.TimeoutError):
+                await fetch_html_via_nodriver("https://example.com")
+
+        self.assertEqual(doubles.runner.await_count, 1)
+        self.assertEqual(doubles.builder.call_count, 1)
+        self.assertEqual(doubles.pool.acquire.await_count, 1)
+
+    async def test_a_successful_pooled_run_leaves_its_browser_running(self) -> None:
+        """Keep the browser that reuse exists to keep
+
+        The negative polarity of the terminate, and the one a careless fix
+        breaks: terminating unconditionally in the `finally` would relaunch
+        Chromium after every successful request, which is precisely the cost
+        pooling removes and would look like a working system.
+        """
+        from kindly_web_search_mcp_server.scrape.chromium_pool import ChromiumSlot
+        from kindly_web_search_mcp_server.scrape.universal_html import (
+            fetch_html_via_nodriver,
+        )
+
+        slot = ChromiumSlot(slot_id=14, host="127.0.0.14", port=9454)
+
+        with pooled_doubles(slots=[slot], run=[WORKER_STDOUT.decode()]) as doubles:
+            html = await fetch_html_via_nodriver("https://example.com")
+
+        self.assertEqual(html, WORKER_STDOUT.decode())
+        self.assertEqual(slot.terminate.await_count, 0)
+        self.assertEqual(recorded_pool_calls(doubles.recorder), ["release"])
+
+    async def test_a_worker_that_exited_on_its_own_leaves_its_browser_running(
+        self,
+    ) -> None:
+        """Trust the cleanup of a worker that was allowed to finish
+
+        A worker that raised and *exited* ran its own `_cleanup` and closed the
+        tab it navigated, so its slot is clean however the failure is classified.
+        This case drives a message the restart classifier does not match, so
+        nothing else in the function intervenes, and asserts the slot goes back
+        untouched.
+
+        Without it, "terminate whenever the run raised" would pass every other
+        case here while relaunching the browser on failures that never dirtied
+        it.
+        """
+        from kindly_web_search_mcp_server.scrape.chromium_pool import ChromiumSlot
+        from kindly_web_search_mcp_server.scrape.universal_html import (
+            fetch_html_via_nodriver,
+        )
+
+        slot = ChromiumSlot(slot_id=15, host="127.0.0.15", port=9455)
+
+        with pooled_doubles(
+            slots=[slot], run=[ValueError("nothing the classifier knows about")]
+        ) as doubles:
+            with self.assertRaises(ValueError):
+                await fetch_html_via_nodriver("https://example.com")
+
+        self.assertEqual(slot.terminate.await_count, 0)
+        self.assertEqual(recorded_pool_calls(doubles.recorder), ["release"])
+
+    async def test_a_timeout_on_the_restart_retry_terminates_the_replacement_slot(
+        self,
+    ) -> None:
+        """Cover the second run as well as the first
+
+        The restart path runs the worker a second time, and that run can time out
+        too. A flag set at only the first call site would leave the *replacement*
+        slot dirty — the original defect, one retry later — which is why the
+        recording wraps both call sites rather than the first.
+
+        Each slot is terminated by a different mechanism here, and both must
+        happen exactly once: the first by the restart path, which was already
+        doing it, and the second by the `finally`, which is what this change
+        adds.
+        """
+        from kindly_web_search_mcp_server.scrape.chromium_pool import ChromiumSlot
+        from kindly_web_search_mcp_server.scrape.universal_html import (
+            fetch_html_via_nodriver,
+        )
+
+        first = ChromiumSlot(slot_id=16, host="127.0.0.16", port=9456)
+        second = ChromiumSlot(slot_id=17, host="127.0.0.17", port=9457)
+
+        with pooled_doubles(
+            slots=[first, second],
+            run=[
+                RuntimeError("nodriver worker failed (exit=1): boom"),
+                asyncio.TimeoutError(),
+            ],
+        ) as doubles:
+            with self.assertRaises(asyncio.TimeoutError):
+                await fetch_html_via_nodriver("https://example.com")
+
+        self.assertEqual(
+            recorded_pool_calls(doubles.recorder),
+            ["terminate_16", "release", "terminate_17", "release"],
+        )
+        self.assertEqual(
+            [call.args[0] for call in doubles.pool.release.await_args_list],
+            [first, second],
+        )
+
+    async def test_a_terminate_that_raises_does_not_mask_the_workers_timeout(
+        self,
+    ) -> None:
+        """Report what the caller needs, even when the recovery itself fails
+
+        The terminate runs in the `finally`, which is the one place an exception
+        replaces the one already propagating. A caller told its browser could not
+        be killed, instead of that its fetch timed out, has been handed the wrong
+        problem — and `_terminate_process` reaches real processes, so this is a
+        live path rather than a hypothetical one.
+
+        The release must still happen too: a slot dropped here is a slot the pool
+        never gets back, and enough of those starve reuse down to the cold-browser
+        fallback.
+        """
+        from kindly_web_search_mcp_server.scrape.chromium_pool import ChromiumSlot
+        from kindly_web_search_mcp_server.scrape.universal_html import (
+            fetch_html_via_nodriver,
+        )
+
+        slot = ChromiumSlot(slot_id=18, host="127.0.0.18", port=9458)
+
+        with pooled_doubles(
+            slots=[slot],
+            run=[asyncio.TimeoutError()],
+            terminate_error=OSError("cannot signal the browser"),
+        ) as doubles:
+            with self.assertRaises(asyncio.TimeoutError):
+                await fetch_html_via_nodriver("https://example.com")
+
+        self.assertEqual(slot.terminate.await_count, 1)
+        self.assertEqual(doubles.pool.release.await_count, 1)
+
+    async def test_recycling_a_killed_workers_slot_is_announced(self) -> None:
+        """Say that the browser was recycled, because nothing else will
+
+        This recovery is invisible in the result: the caller gets the same
+        `TimeoutError` either way, and the only difference is which browser the
+        *next* request lands on. An operator watching reuse degrade has no other
+        signal to read, and the whole reason issue #96 survived so long is that a
+        silent relaunch looks like slowness rather than a fault.
+        """
+        from kindly_web_search_mcp_server.scrape.chromium_pool import ChromiumSlot
+        from kindly_web_search_mcp_server.scrape.universal_html import (
+            fetch_html_via_nodriver,
+        )
+
+        slot = ChromiumSlot(slot_id=19, host="127.0.0.19", port=9459)
+        diagnostics = Diagnostics(
+            request_id="recycle", enabled=True, stream=io.StringIO()
+        )
+
+        # The only case here with diagnostics *enabled*, which is the one
+        # condition under which `fetch_html_via_nodriver` runs the pipe probe --
+        # a real `create_subprocess_exec`. Doubled for the reason the four other
+        # diagnostics-enabled cases in this file double it: nothing at this layer
+        # may spawn a process.
+        with (
+            pooled_doubles(slots=[slot], run=[asyncio.TimeoutError()]),
+            patch(
+                "kindly_web_search_mcp_server.scrape.universal_html._run_pipe_probe",
+                new_callable=AsyncMock,
+            ),
+        ):
+            with self.assertRaises(asyncio.TimeoutError):
+                await fetch_html_via_nodriver(
+                    "https://example.com", diagnostics=diagnostics
+                )
+
+        recycled = [
+            entry for entry in diagnostics.entries if entry["stage"] == "pool.slot_recycled"
+        ]
+        self.assertEqual(len(recycled), 1)
+        self.assertEqual(recycled[0]["data"]["slot_id"], 19)
+
     async def _unpooled_fetch_recording_its_profile_directory(
         self, *, run_worker: AsyncMock
     ) -> tuple[str | None, bool]:
@@ -833,6 +1183,22 @@ class TestUniversalHtmlLoader(unittest.IsolatedAsyncioTestCase):
         which is the defect the four-statement ordering in the restart block
         exists to prevent. Cancellation is the commonest way a real fetch ends,
         so it is the path where neither may be true.
+
+        **What "keeps the directory" means changed, and the double had to catch
+        up.** A cancelled worker is a *killed* worker, so the parent now
+        terminates the slot before releasing it — and `ChromiumSlot.terminate`
+        disposes of the profile directory along with the process that owns it,
+        which is coherent because `ensure_started` then rebuilds both. The
+        guarantee this case holds is narrower and unchanged: **the parent must
+        not delete a directory it only borrowed**, by reaching for
+        `_remove_worker_profile_directory` on a pooled run. Disposal is the
+        slot's business, on a slot it is also relaunching.
+
+        So `terminate` is doubled rather than absent. Left absent it was an
+        `AttributeError` swallowed by the recycle's own ``suppress``, and this
+        case passed while the behaviour under it went unexercised — measured:
+        removing that ``suppress`` turned this case red, which is how the gap
+        was found.
         """
         from kindly_web_search_mcp_server.scrape.universal_html import (
             fetch_html_via_nodriver,
@@ -846,6 +1212,7 @@ class TestUniversalHtmlLoader(unittest.IsolatedAsyncioTestCase):
             slot_id="slot-0",
             user_data_dir=SimpleNamespace(name=slot_dir),
             browser_executable_path=None,
+            terminate=AsyncMock(),
         )
         pool = AsyncMock()
         pool.acquire = AsyncMock(return_value=slot)
@@ -872,10 +1239,14 @@ class TestUniversalHtmlLoader(unittest.IsolatedAsyncioTestCase):
             await fetch_html_via_nodriver("https://example.com")
 
         assert os.path.isdir(slot_dir), (
-            f"the pool's profile directory {slot_dir} was deleted while a "
-            "cancellation unwound. The next caller to take this slot gets a "
-            "browser whose profile is gone."
+            f"the pool's profile directory {slot_dir} was deleted by the parent "
+            "while a cancellation unwound. Disposing of a pooled profile is the "
+            "slot's own business, on a slot it is relaunching; a parent that "
+            "deletes a directory it borrowed corrupts a live browser."
         )
+        # The recycle did happen, and the assertion above is about *who* removes
+        # the directory rather than about nothing having touched the slot.
+        slot.terminate.assert_awaited_once()
         pool.release.assert_awaited_once()
 
     async def test_pool_acquisition_failure_falls_back_to_an_unpooled_run(self) -> None:
