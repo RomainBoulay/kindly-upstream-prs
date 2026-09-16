@@ -58,21 +58,22 @@ does, so it is unconditional rather than probed — a probe would add a CDP
 round-trip and a second path to guard the one state the branch already knows it
 is in.
 
-**Constraint this creates:** `newWindow` is unsupported by
-`chrome-headless-shell`, which an operator can select through
-`KINDLY_BROWSER_EXECUTABLE_PATH` / `BROWSER_EXECUTABLE_PATH` / `CHROME_BIN` /
-`CHROME_PATH`. **The pooled path requires a full Chrome/Chromium.** The launcher
-passes `--headless=new` (`_build_chromium_launch_args`), which is full headless
-Chrome and supports windows; the constraint is on the binary, not the flag. On a
-headless-shell binary every pooled creation would be refused and the parent would
-restart the slot on every request — reuse would degrade to a cold start per
-request, silently, which is the failure mode issue #96 described.
+**It constrains no binary — checked, because the protocol reference reads as if
+it did.** The CDP docs mark `newWindow` "not supported by headless shell", and
+the browser binary is operator-selected (`KINDLY_BROWSER_EXECUTABLE_PATH`,
+`BROWSER_EXECUTABLE_PATH`, `CHROME_BIN`, `CHROME_PATH`), so a headless-shell
+binary looked like a way to make every pooled request fail. It is not:
+*unsupported* there means the windowing semantics are not honoured — the shell
+has no windows and hands back a tab either way — **not** that the call errors.
+Measured, see §1.3. `new_window=True` is accepted by every binary measured and is
+the only value that works on full Chrome, so there is nothing to guard and no
+fallback path to maintain.
 
 `enable_begin_frame_control=True` is kept on the call because nodriver's own
-`Browser.get()` sends it and Chrome accepts and ignores it under `--headless=new`
-(measured, Chrome 153). The protocol reference marks it headless-shell-only, so
-it has no consumer here; it stays only to keep the call identical to the
-library's, and removing it would be safe.
+`Browser.get()` sends it, and removing it changes nothing: measured, every
+`newWindow` outcome is identical with and without it. The protocol reference
+marks it headless-shell-only, so it has no consumer here; it stays only to keep
+the call identical to the library's, and removing it would be safe.
 
 ### 1.3 Chromium behaviours this design rests on
 
@@ -91,6 +92,20 @@ browser doubled. Measured on Chrome 153 under `--headless=new` on Windows
    `--window-size=1920,1080`, with no `width`/`height` passed to
    `Target.createTarget`. A negative result, recorded because making a dead
    branch live invites exactly this question: requests 2+ render as request 1 does.
+5. **`chrome-headless-shell` accepts `newWindow=true`**, despite the protocol
+   reference marking it unsupported there. Measured per binary, in the
+   zero-page-target state, with and without `enable_begin_frame_control` (which
+   changed no outcome):
+
+   | Binary | `newWindow=true` | `newWindow=false` |
+   |---|---|---|
+   | `chrome-headless-shell` 145.0.7632.6 | accepted | accepted |
+   | same, plus `--headless=new` | accepted | accepted |
+   | Chrome 153.0.8010.36, `--headless=new` | accepted | **refused** |
+
+   So `true` is accepted everywhere measured and is the only value that works on
+   full Chrome. This is what retired the "the pooled path requires full Chrome"
+   claim an earlier draft of §1.2 carried.
 
 (1) is what makes the pool's health probe insufficient on its own: `ChromiumSlot.
 ensure_started` probes `/json/version`, which answers for a browser with no
@@ -122,15 +137,34 @@ degrades diagnosis, not recovery.
 
 What *does* escape the list is a failure with **no message**. See the gap below.
 
-**Known gap — the timeout path leaves a tab behind.** When the parent kills a
-timed-out worker, `_cleanup` never runs and the navigated tab survives in the
-pooled browser. `asyncio.TimeoutError` carries an empty message, so it matches
-none of the patterns and the slot is released untouched; the next request then
-takes that tab and inherits the previous request's live document. With pool size
-1 and a page that blocks `Page.navigate`, the slot can stay wedged. Accepted for
-now — classifying the timeout would change recovery behaviour well beyond the
-create-a-target defect that surfaced it — and recorded here so it is not
-rediscovered as a new bug.
+**A killed worker is handled by type, not by message.** `_run_worker_command`
+kills the whole process tree on a timeout and on a cancellation, and re-raises.
+A killed worker never ran `_fetch_html`'s `_cleanup`, so the pooled browser still
+holds the page it was navigating — the slot is dirty *by construction*, and no
+message says so: `TimeoutError` carries an empty string, and `CancelledError`
+derives from `BaseException` and never reaches the classifier at all.
+
+So `fetch_html_via_nodriver` records the kill where it happens —
+`_run_worker_noting_kills`, which wraps **both** worker runs, the first and the
+restart path's retry — and its `finally` terminates the slot before releasing it.
+`ChromiumSlot.terminate` clears `proc`, and `ensure_started` relaunches a slot
+whose `proc` is `None`, so the next acquirer gets a clean browser. Three details
+are load-bearing:
+
+- **Terminate before release.** Released first, the queue can hand the dirty
+  browser to a waiting caller before the terminate lands.
+- **The terminate is suppressed.** It runs in a `finally`, where a raise would
+  replace the timeout the caller needs to see; the release still happens, because
+  a dropped slot is one the pool never gets back.
+- **The request is not retried.** The budget that expired is the caller's.
+  Re-running the worker under a fresh `total_timeout_seconds` would turn one hung
+  fetch into two. Recovery here is for the *next* request, which is all it needs
+  to be — so the timeout is deliberately **not** added to
+  `_pool_error_requires_restart`, whose match implies a retry.
+
+The recovery is invisible in the result, so it emits `pool.slot_recycled`. That
+is the only signal an operator has; a silent relaunch reads as slowness, which is
+how the issue-#96 defect survived.
 
 ### 1.5 What reuse deliberately does not isolate
 

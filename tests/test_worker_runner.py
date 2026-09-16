@@ -263,10 +263,11 @@ def test_worker_runner_does_not_from_import_the_spawn_primitive() -> None:
     )
 
 
-# Everything the extraction moved out of `universal_html.py`. A list, not a spot
-# check: the move is only worth its diff if the whole block travelled. Shared by
-# the two cases below so the set has one definition -- a second enumeration is
-# the drift this list exists to prevent.
+# Everything the extraction moved out of `universal_html.py`, plus anything added
+# to this module since. A list, not a spot check: the move is only worth its diff
+# if the whole block travelled. Shared by the two cases below so the set has one
+# definition -- a second enumeration is the drift this list exists to prevent,
+# and the last of those cases fails on a module-level symbol left out of it.
 PROCESS_MANAGEMENT_SURFACE = (
     "_run_worker_command",
     "_run_pipe_probe",
@@ -291,6 +292,11 @@ PROCESS_MANAGEMENT_SURFACE = (
     "_subprocess_launch_options",
     "_StdoutAccumulator",
     "_StderrAccumulator",
+    # Added here rather than moved: the pooled caller needs to know whether a run
+    # ended with the child killed or allowed to exit, and only this module can
+    # answer -- the answer is `asyncio.TimeoutError` / `asyncio.CancelledError`,
+    # two names `universal_html.py` is held to not importing.
+    "_worker_was_killed",
 )
 
 
