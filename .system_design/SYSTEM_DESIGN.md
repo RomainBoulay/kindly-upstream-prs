@@ -47,12 +47,13 @@ way. `Browser.connection` is *not* a usable seam — `Browser.__init__` assigns
 `self.connection: Connection = None` and nothing in the package ever reassigns
 it, so `browser.connection.send(...)` raises `AttributeError` on every call.
 Verified by reading nodriver 0.50.3. **That is the only version it is verified
-against.** `pyproject.toml` allows `>=0.50,<1` and labels its own pre-1.0
-ceilings nominal — meaning the upper bound was never tested, only assumed — so
-any 0.5x release could reintroduce a `connection` attribute or change how
-`Browser.get()` sends, and nothing here would notice until a pooled fetch failed.
-`tests/test_worker_pooled_target.py` doubles the browser and so cannot see a
-library change either. Re-read `Browser.get()` when bumping nodriver.
+against.** `pyproject.toml` allows `>=0.50,<1`, and that `<1` bound protects
+nothing here: it was assumed rather than tested, and a pre-1.0 library is free
+to change this between 0.50.3 and 0.99. Any such release could reintroduce a
+live `connection` attribute or change how `Browser.get()` sends, and nothing
+would notice until a pooled fetch failed —
+`tests/test_worker_pooled_target.py` doubles the browser, so it cannot see a
+library change either. **Re-read `Browser.get()` when bumping nodriver.**
 
 **Why `new_window=True`:** the create branch is reachable only when there are no
 page targets, and Chromium closes a window when its last tab closes. A
