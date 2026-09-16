@@ -38,13 +38,19 @@ Windows (2026-09-16), and reported on snap Chromium 152.0.7977.64 on Linux in
 issue #96. A ``chromium``-lane case would hold them; that lane is registered in
 ``pyproject.toml`` and run nowhere today, so `TEST_SUITE.md` §9 carries the gap.
 
-**Two things this module deliberately does not cover.** Every case passes
+**One thing this module deliberately does not cover.** Every case passes
 ``referer=None``: in reuse mode the referer and the URL share one tab, so
 `_cleanup` closes the same object twice and the second close is swallowed by its
 blanket ``except Exception``. That is pre-existing and unrelated to target
-creation. And ``new_window`` is sent unconditionally, which requires a full
-Chrome/Chromium -- ``chrome-headless-shell``, which an operator can select
-through ``KINDLY_BROWSER_EXECUTABLE_PATH``, does not support it.
+creation.
+
+An earlier draft of this docstring named a second gap -- that sending
+``new_window`` unconditionally required a full Chrome/Chromium, because the
+protocol reference marks the parameter unsupported by ``chrome-headless-shell``.
+**Measured false, and removed rather than left as a caveat**: the shell *accepts*
+``newWindow=true`` and hands back a tab, because "unsupported" there means the
+windowing semantics are not honoured, not that the call errors. ``SYSTEM_DESIGN.md``
+§1.3 carries the table.
 
 **Every double is autospecced from the real class**, following
 :mod:`tests.test_nodriver_worker_sandbox` and for the reason that module records:
@@ -77,7 +83,7 @@ import contextlib
 import os
 from collections.abc import Iterator
 from typing import Any
-from unittest.mock import create_autospec, patch
+from unittest.mock import NonCallableMagicMock, create_autospec, patch
 
 import nodriver
 import pytest
@@ -237,8 +243,17 @@ class PooledBrowser:
         strictly stronger and deliberately *un*-faithful -- a read of ``None``
         succeeds and only *using* it fails, so a case asserting that the attribute
         is never read at all cannot be written against the faithful form.
-        ``create_autospec`` gives each mock its own type (measured), so patching
-        the property here reaches this double only.
+        **Patching the type reaches this double only**, which is worth stating
+        because the code reads like the opposite: ``create_autospec``
+        synthesises a fresh subclass *also named* ``NonCallableMagicMock`` per
+        mock, so ``type(self.browser)`` is private to this instance despite a
+        ``__name__`` that suggests the shared class. Nothing is left behind and
+        no teardown is owed.
+
+        Asserted rather than only measured, by
+        :func:`test_the_connection_trap_does_not_leak_to_other_doubles`: two
+        review rounds read this line as session-wide mock pollution, so the
+        isolation is now a case that would fail if it ever stopped holding.
 
         Args:
             trap: Raise on read instead of answering ``None``.
@@ -526,6 +541,51 @@ async def test_a_target_that_cannot_be_created_is_reported_as_a_pool_failure() -
         pytest.raises(RuntimeError, match="Failed to create pooled target"),
     ):
         await fetch_pooled_html()
+
+
+def test_the_connection_trap_does_not_leak_to_other_doubles() -> None:
+    """Keep the read-trap inside the one double that asked for it
+
+    A harness check rather than a claim about production, and the only one in
+    this module. `PooledBrowser._install_connection` assigns a property to
+    ``type(self.browser)``, and two review rounds read that as installing onto
+    the shared :class:`unittest.mock.NonCallableMagicMock` and leaking to every
+    later mock in the pytest session -- which would make the *other* five cases
+    pass or fail depending on the order they ran in, the worst failure a suite
+    can have.
+
+    It does not leak, because ``create_autospec`` builds a per-mock subclass that
+    merely *reuses the name* ``NonCallableMagicMock``. That is genuinely
+    surprising, and a comment saying so is only as good as the reader's trust in
+    it, so this asserts it instead: the shared class stays clean, an independent
+    double still takes an ordinary ``connection``, and the trapped one still
+    raises.
+
+    Synchronous, because nothing here runs the worker. One harness at a time,
+    too: :func:`pooled_harness` patches :func:`nodriver.start` with an autospec,
+    and a second one entered inside the first would try to autospec that patch,
+    which `unittest.mock` refuses outright (``InvalidSpecError: Cannot spec a
+    Mock object``) -- so a nested-harness version of this case fails on its own
+    setup and proves nothing either way.
+    """
+    with pooled_harness(trap_connection=True) as trapped:
+        # The shared class is what a leak would touch, so name it directly
+        # rather than inferring from behaviour.
+        assert "connection" not in vars(NonCallableMagicMock)
+
+        with pytest.raises(AssertionError, match="read `browser.connection`"):
+            _ = trapped.browser.connection
+
+        # An independent double, built while the trap is installed: the case
+        # against a leak, at the moment a leak would be live.
+        sibling = create_autospec(nodriver.Browser, instance=True)
+        sibling.connection = None
+        assert sibling.connection is None
+
+    # And one built after the harness exits, since nothing undoes the property.
+    later = create_autospec(nodriver.Browser, instance=True)
+    later.connection = None
+    assert later.connection is None
 
 
 async def test_a_created_target_that_never_appears_is_reported_with_its_id() -> None:
