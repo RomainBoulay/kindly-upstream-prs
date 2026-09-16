@@ -369,6 +369,45 @@ arbitrary:
   in Sofya and You.com, so Serply sits on the raising side of the split §14
   records.
 
+**apifare, added after Serply (PR #95), is appended last**, so a deployment that
+already had a key keeps its provider — `test_search_router.py::test_prefers_serply_over_apifare_when_both_keys`
+pins the adjacent pair. It follows the E5-8 layout: `tests/test_apifare_unit.py`
+for the request and the parsing, written pytest-first, plus a row in the shared
+error-path table and a row in the credential-disclosure sweep. Four choices in
+the module would otherwise look arbitrary:
+
+- **It is configured by a bearer token, not a per-vendor API key**, because
+  apifare resells search against a prepaid balance. That is also why its registry
+  `label` is lowercase `apifare` where every other label is capitalised: it is the
+  vendor's own spelling, and `test_the_message_names_the_provider_by_its_label`
+  compares case-sensitively, so the two must agree.
+- **HTTP 402 is intercepted before `raise_for_status`** and raised as
+  `ApifarePaymentRequiredError`. An exhausted prepaid balance is a condition the
+  operator can clear, and the router would otherwise flatten it to
+  `SearchProviderTransportError: ... HTTP 402` and drop the top-up link. The
+  message names the provider and the status the way `_without_request_url` does,
+  and *attributes* the exhausted balance to apifare rather than asserting it,
+  because the same branch also catches a 402 from a proxy or a CDN that never
+  reached apifare.
+- **The top-up link is validated before it is quoted, and re-composed from the
+  parsed parts rather than echoed.** This is the only place in any provider where
+  a string chosen by a provider's server reaches an error message, and that
+  message is served to an LLM agent — §14 records what that buys and what it does
+  not. `_safe_topup_url` requires `https`, no userinfo, no port, a host equal to
+  `apifare.com` or a subdomain, no whitespace or control characters, at most 200
+  characters, and no occurrence of the bearer token. The token rule is not
+  redundant with the host rule: a URL on the genuine host can carry the token in
+  its query string, and the first draft of this validator did exactly that until
+  `test_the_402_message_never_carries_the_bearer_token` caught it.
+- **An absent `results` key returns `[]`; a `results` key of the wrong type
+  raises.** The rule file's "empty results are a valid answer, not an error"
+  governs the first, and for an API whose envelope nobody has confirmed, omitting
+  the key is the likeliest spelling of "nothing matched". A present-but-reshaped
+  container is a different claim and puts apifare on the raising side of the
+  split §14 records. `count` is forwarded unclamped — not because apifare
+  documents no maximum, as Serply does, but because nothing is known about its
+  bound at all; see the unverified-wire-format entry in §14.
+
 **Launch-argument and sandbox decisions.** `_build_chromium_launch_args`,
 `_resolve_sandbox_enabled`, `_resolve_browser_executable_path`,
 `_resolve_start_retry_attempts`, `_resolve_snap_backoff_multiplier`,
@@ -3020,8 +3059,8 @@ The **Today** column describes *test coverage*, not implementation status.
 | Subsystem / behaviour | Today | Target layer | CI job | Owner |
 |---|---|---|---|---|
 | Provider routing, strict order, no fallback | covered | L1 | `fast` | |
-| Serper / SerpBase / Tavily / SearXNG / Sofya / You.com / Serply parsing | covered (E5-8; Serply in PR #94) — §3.1 records what landed | L1 | `fast` | |
-| Provider errors: 401, 429, malformed JSON, timeout, empty | covered (E5-8) — all seven providers, one table | L1 (`httpx.MockTransport`) | `fast` | |
+| Per-provider response parsing | covered (E5-8; Serply in PR #94; apifare in PR #95) — §3.1 records what landed | L1 | `fast` | |
+| Provider errors: 401, 429, malformed JSON, timeout, empty | covered (E5-8) — every provider, one table | L1 (`httpx.MockTransport`) | `fast` | |
 | Provider registry ⇄ docs | covered | L2 | `fast` | |
 | StackExchange / GitHub issues / GitHub discussions / Wikipedia | partial — parsing covered, failure paths thin | L1 + L2 | `fast` | |
 | arXiv + PDF extraction | partial | L1 | `fast` | |
@@ -5013,10 +5052,9 @@ is nothing to test.
   `test_search_searxng_arms_no_request_timeout_by_default` pins the current
   answer so a change to it is deliberate. Which deadline SearXNG should carry is
   a production decision with no owner yet.
-- **The seven providers disagree on what a reshaped result container means, and
+- **The providers disagree on what a reshaped result container means, and
   nobody decided it.** `serper.py` and `serpbase.py` return `[]` when `organic` /
-  `organic_results` is present but not a list; `tavily.py`, `searxng.py`,
-  `sofya.py`, `youcom.py` and `serply.py` raise. The raising side carries a recorded reason —
+  `organic_results` is present but not a list; every other provider raises. The raising side carries a recorded reason —
   *"returning an empty list would be indistinguishable from 'no matches' and
   would hide the mismatch"* — which argues against the silent `[]` in the two
   providers a default deployment reaches **first**. E5-8 pins both behaviours as
@@ -5033,6 +5071,51 @@ is nothing to test.
   reject or decode before routing. A rejected form would surface as an HTTP
   error status on Serply queries, reported by the router as a
   `SearchProviderTransportError` naming Serply and the status.
+- **apifare's wire format has never been run against the live API, and half of
+  it cannot be. ACCEPTED** — a known risk, not a gap with an owner. PR #95 added
+  `search_apifare`, which posts `{"q", "count"}` to
+  `https://apifare.com/v1/call/dataforseo` and reads
+  `result.results[].{title,url,description}`. apifare's public documentation
+  shows `POST /v1/call/{slug}` with parameters as a JSON body — the route *shape*
+  matches — but names no `dataforseo` slug, no `q`/`count` fields and no
+  `result.results` envelope; its `/proxy/{provider}/{path}` route returns native
+  provider payloads, and DataForSEO's own SERP shape is `tasks[].result[].items[]`,
+  nothing like what is parsed here. No key was available to the maintainer
+  (2026-09-16), and the contributor is the vendor, so the only party able to
+  verify is the one proposing the change.
+
+  `tests/test_apifare_unit.py` pins what is *sent*, in full, so the guess is
+  fixed rather than floating. `tests/test_apifare_live.py` is the artefact that
+  settles the 200 path: `KINDLY_RUN_LIVE_TESTS=1 APIFARE_TOKEN=... pytest
+  tests/test_apifare_live.py`. It is marked `live`, and CI selects
+  `-m "not live and not chromium and not package"`, so **no scheduled job runs
+  it today** — adding one needs a repository secret, per §6.3.
+
+  **The 402 envelope has no path to verification at all.** A funded account
+  cannot produce a 402, so `topup_url` as a field name, and the body shape around
+  it, stay a guess permanently. That is why `_safe_topup_url` treats whatever
+  arrives as untrusted rather than as documented: if the field is absent or named
+  something else, the operator gets the fixed sentence and nothing breaks.
+
+  A mismatch on the 200 path surfaces as `ApifareError` naming which part of the
+  envelope was missing — not as an empty result set, which is what the module did
+  when it arrived and what made this risk hard to see.
+
+- **Quoting a validated top-up URL admits bounded remote prose, deliberately.
+  ACCEPTED** — `_safe_topup_url` bounds *where* the link points and how long it
+  is, not what it says: up to 200 characters of attacker-chosen path and query on
+  a genuine `apifare.com` host reach the agent inside an error message. Weighed
+  against dropping the URL entirely, which is what `_without_request_url` does
+  for every other provider and what `searxng.py` does for derived text. The
+  argument for quoting it: an exhausted prepaid balance is the one provider
+  failure an operator can fix immediately, and the link is the fix. The argument
+  that makes the residue tolerable: a provider whose server is hostile already
+  controls every `title` and `snippet` the tool returns, which is a far larger
+  channel than 200 characters — so the marginal exposure is the *framing* (an
+  error message reads as this server's own voice) rather than the capacity. If
+  that trade is later judged wrong, the repair is small and local: drop the
+  `topup_url` branch and keep the fixed sentence.
+
 - **`_is_snap_browser` misclassified the commonest snap install. CLOSED** — the
   repair landed as a change of its own, which is what this entry said it
   deserved. `/snap/bin/chromium` is a symlink to `/usr/bin/snap` on Ubuntu and

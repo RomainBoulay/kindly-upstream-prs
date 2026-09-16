@@ -231,6 +231,56 @@ class TestSearchRouter(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out[0].link, "https://youcom.example")
         mock_serply.assert_not_awaited()
 
+    async def test_uses_apifare_when_only_apifare_token(self) -> None:
+        """Select apifare when it is the only configured provider"""
+        from kindly_web_search_mcp_server.search import PROVIDERS, search_web
+
+        # `patch.dict` restores the environment, so no token leaks into later tests.
+        with patch.dict(os.environ):
+            for provider in PROVIDERS:
+                os.environ.pop(provider.env_var, None)
+            os.environ["APIFARE_TOKEN"] = "apifare_test"
+
+            with patch(
+                "kindly_web_search_mcp_server.search.search_apifare", new_callable=AsyncMock
+            ) as mock_apifare:
+                mock_apifare.return_value = [
+                    WebSearchResult(title="A", link="https://apifare.example", snippet="sn", page_content="")
+                ]
+                out = await search_web("q", num_results=1)
+
+        self.assertEqual(out[0].link, "https://apifare.example")
+        mock_apifare.assert_awaited()
+
+    async def test_prefers_serply_over_apifare_when_both_keys(self) -> None:
+        """Keep an existing Serply deployment on Serply after apifare is added
+
+        apifare is appended last, so setting its token beside any earlier
+        provider's must not change which provider serves the query. Serply is the
+        provider immediately before it in the registry, so this pins the one
+        adjacency the new entry could have broken.
+        """
+        from kindly_web_search_mcp_server.search import PROVIDERS, search_web
+
+        with patch.dict(os.environ):
+            for provider in PROVIDERS:
+                os.environ.pop(provider.env_var, None)
+            os.environ["SERPLY_API_KEY"] = "serply_test"
+            os.environ["APIFARE_TOKEN"] = "apifare_test"
+
+            with patch(
+                "kindly_web_search_mcp_server.search.search_serply", new_callable=AsyncMock
+            ) as mock_serply, patch(
+                "kindly_web_search_mcp_server.search.search_apifare", new_callable=AsyncMock
+            ) as mock_apifare:
+                mock_serply.return_value = [
+                    WebSearchResult(title="S", link="https://serply.example", snippet="sn", page_content="")
+                ]
+                out = await search_web("q", num_results=1)
+
+        self.assertEqual(out[0].link, "https://serply.example")
+        mock_apifare.assert_not_awaited()
+
     async def test_raises_when_no_provider_configured(self) -> None:
         from kindly_web_search_mcp_server.search import WebSearchProviderError, search_web
 

@@ -1,7 +1,33 @@
 # Rule: search providers (`search/`)
 
-Seven backends — Serper, SerpBase, Tavily, SearXNG, Sofya, You.com and Serply — behind one
-registry. They share a single contract, which is why they share one rule file.
+Every search backend — Serper, SerpBase, Tavily, SearXNG, Sofya, You.com, Serply
+and apifare, in selection order — sits behind one registry. They share a single
+contract, which is why they share one rule file.
+
+## Adding a provider touches more than `PROVIDERS`
+
+Two consecutive provider PRs each left hand-maintained lists behind, so the list
+is written down rather than rediscovered. `tests/test_provider_registry_consistency.py`
+guards the first four automatically; the rest are hand-maintained and a new
+provider is invisible to them until someone adds a row.
+
+Guarded (a missing entry fails a test):
+
+- `PROVIDERS` in `search/__init__.py` — the source of truth; append last, so no
+  existing deployment changes which provider serves it.
+- `web_search`'s docstring in `server.py`, `.env.example`, and every README line
+  that enumerates provider variables.
+
+Unguarded (nothing fails; check them by hand):
+
+- `DISCLOSURE_CASES` in `tests/test_provider_credential_disclosure.py`.
+- `PROVIDER_CASES` in `tests/test_search_provider_error_paths.py`.
+- The adjacent-pair preference test in `tests/test_search_router.py`, which pins
+  that the new entry did not displace the provider before it.
+- The backend list at the top of this file.
+- `--min-selected` in `.github/workflows/tests-broad.yml`, which
+  `tests/test_ci_collection_floors.py` asserts by **equality** — new tests make
+  it red until the number is re-read from a run.
 
 ## `PROVIDERS` is the single source of truth
 

@@ -1,9 +1,9 @@
-"""Transport-level failure paths for the seven search-provider coroutines.
+"""Transport-level failure paths for every search-provider coroutine.
 
-One module rather than seven because the five failures pinned here -- ``401``,
+One module rather than one per provider because the five failures pinned here -- ``401``,
 ``429``, a non-JSON body, a well-formed JSON body of the wrong shape, and a
 timeout -- are identical in shape across every provider. Splitting per provider
-would copy the :class:`httpx.MockTransport` helper seven times and let the seven
+would copy the :class:`httpx.MockTransport` helper once per provider and let them
 copies drift.
 
 **What this module does and does not own.** It owns the contract every provider
@@ -14,7 +14,7 @@ malformed items, empty results -- which stays in that provider's own
 ``test_<name>_unit`` module. Nor does it own the *wording* of SearXNG's
 per-status messages: those live beside SearXNG's other behaviour in
 ``test_searxng_unit.py``, because a message is that provider's own choice while
-the contract here is shared by all seven.
+the contract here is shared by all of them.
 
 **Three things make these cases non-vacuous, and all three are needed.** Every
 provider's ``*ConfigError`` subclasses its ``*Error``, so a case that loses its
@@ -50,6 +50,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from kindly_web_search_mcp_server.models import WebSearchResult
+from kindly_web_search_mcp_server.search.apifare import ApifareError, search_apifare
 from kindly_web_search_mcp_server.search.searxng import SearxngError, search_searxng
 from kindly_web_search_mcp_server.search.serpbase import SerpbaseError, search_serpbase
 from kindly_web_search_mcp_server.search.serper import SerperError, search_serper
@@ -73,11 +74,11 @@ class ProviderCase:
         body_error: Exact exception class raised for a body this provider cannot
             parse.
         status_error: Exact exception class raised for an HTTP error status.
-            Six providers call ``raise_for_status()`` and let
+            Every provider but SearXNG calls ``raise_for_status()`` and lets
             :class:`httpx.HTTPStatusError` out; SearXNG classifies the status
             itself and its per-instance loop then wraps the result.
         timeout_error: Exact exception class the caller sees when the transport
-            times out. Six providers do not catch it, so the transport's own
+            times out. No provider but SearXNG catches it, so the transport's own
             :class:`httpx.ReadTimeout` arrives; SearXNG's loop catches every
             exception and re-raises its aggregate.
     """
@@ -144,6 +145,17 @@ PROVIDER_CASES: tuple[ProviderCase, ...] = (
         search_serply,
         {"SERPLY_API_KEY": "test_key"},
         SerplyError,
+        httpx.HTTPStatusError,
+        httpx.ReadTimeout,
+    ),
+    # apifare intercepts one status -- 402, an exhausted prepaid balance -- before
+    # `raise_for_status`, so that single code does not reach this table. Every
+    # other status does, which is why `status_error` is the usual one here.
+    ProviderCase(
+        "apifare",
+        search_apifare,
+        {"APIFARE_TOKEN": "test_key"},
+        ApifareError,
         httpx.HTTPStatusError,
         httpx.ReadTimeout,
     ),

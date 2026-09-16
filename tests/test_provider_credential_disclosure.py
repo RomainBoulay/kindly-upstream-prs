@@ -27,16 +27,25 @@ parameter name nobody listed. Stripping parameters named ``api_key``, ``key`` or
 ``token`` is a denylist that fails open and silently on the first name outside
 it. Dropping the URL has no such gap, and needs no pattern to be kept current.
 
-**What makes the seven-provider sweep non-vacuous.** Only SerpBase disclosed on the
+**What makes the provider sweep non-vacuous.** Only SerpBase disclosed on the
 unrepaired tree; the other six already passed, so on their own they are
 regression cover and not evidence. Pointed at a header-authenticating provider,
 a "the secret is absent" assertion passes while proving nothing. So a **sibling
 case** asserts, once per provider, that the credential was genuinely *in flight*
 -- in the request URL for the two providers that carry it there, in a request
-header for the five that do not. A provider that stopped being configured, or
+header for those that do not. A provider that stopped being configured, or
 was swapped for one that never disclosed, fails that control instead of passing
 quietly. The sweep rows themselves assert absence only; the control is what makes
 their absence mean something.
+
+**apifare has a second disclosure surface this sweep does not reach.** Its HTTP
+402 branch is the only place in any provider where a string from a response body
+is quoted into an error message, so a hostile or compromised endpoint could echo
+the bearer token back and have this server relay it. That path never produces an
+``httpx`` failure -- it raises before ``raise_for_status`` -- so it cannot be
+driven from here; it is pinned in ``test_apifare_unit.py`` by planting the token
+in the 402 body. The row below still belongs here: it covers every *other* status
+apifare can answer with.
 
 ``build_environment`` is imported from ``test_search_provider_error_paths``
 rather than copied. Its docstring records the measured reason an environment has
@@ -152,6 +161,13 @@ DISCLOSURE_CASES: tuple[DisclosureCase, ...] = (
         "Serply",
         {"SERPLY_API_KEY": f"serply-{SENTINEL}"},
         f"serply-{SENTINEL}",
+        False,
+    ),
+    DisclosureCase(
+        "apifare",
+        "apifare",
+        {"APIFARE_TOKEN": f"apifare-{SENTINEL}"},
+        f"apifare-{SENTINEL}",
         False,
     ),
 )
@@ -460,11 +476,11 @@ async def test_a_providers_own_error_passes_through_untouched(
 async def test_no_providers_credential_reaches_the_mcp_client(
     case: DisclosureCase, status: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Twenty-one rows: no configured credential appears in what the client sees.
+    """Every provider, every status: no credential appears in what the client sees.
 
-    Three of these -- SerpBase's -- failed before the repair; the other eighteen
-    are regression cover, so that a later change cannot move the
-    disclosure to a provider nobody was watching.
+    Only SerpBase's rows failed before the repair; the rest are regression
+    cover, so that a later change cannot move the disclosure to a provider
+    nobody was watching.
 
     Args:
         case: The provider being driven.
@@ -805,3 +821,123 @@ async def test_an_over_long_query_fails_without_quoting_the_url_or_the_credentia
     assert type(raised.value) is httpx.InvalidURL
     assert case.secret not in str(raised.value)
     assert query[:100] not in str(raised.value)
+
+
+# --------------------------------------------------------------------------
+# apifare's HTTP 402, the one path that quotes a provider's own text.
+# --------------------------------------------------------------------------
+
+
+APIFARE = next(case for case in DISCLOSURE_CASES if case.name == "apifare")
+
+
+async def call_the_tool_with_a_402(
+    body: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> str:
+    """Drive ``web_search`` against an apifare HTTP 402 and return the served text.
+
+    The shared :func:`call_the_tool` cannot be reused: its transport answers
+    every request with ``{"error": "denied"}``, and the whole point here is the
+    body apifare returns alongside the 402.
+
+    Args:
+        body: The JSON body the mocked apifare endpoint answers the 402 with.
+        monkeypatch: pytest's patcher, which restores the environment and the
+            rebound client class when the case ends.
+
+    Returns:
+        The text the MCP client receives, prefixed with ``isError=``.
+    """
+    from kindly_web_search_mcp_server.server import mcp
+
+    build_environment(APIFARE.env, monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Answer every request with the 402 under test.
+
+        Args:
+            request: The outgoing request, which this case does not inspect.
+
+        Returns:
+            The 402 response carrying ``body``.
+        """
+        return httpx.Response(402, json=body)
+
+    class _PaymentRequiredClient(REAL_ASYNC_CLIENT):  # type: ignore[valid-type,misc]
+        """An ``AsyncClient`` whose transport always answers 402."""
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            """Force the 402 transport regardless of what the caller asked for.
+
+            Args:
+                *args: Positional arguments forwarded to :class:`httpx.AsyncClient`.
+                **kwargs: Keyword arguments forwarded likewise, with ``transport``
+                    replaced.
+            """
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _PaymentRequiredClient)
+
+    request = CallToolRequest(
+        method="tools/call",
+        params=CallToolRequestParams(
+            name="web_search", arguments={"query": "q", "num_results": 1}
+        ),
+    )
+    served = await mcp._mcp_server.request_handlers[CallToolRequest](request)
+
+    result = served.root
+    text = " ".join(getattr(block, "text", "") for block in result.content)
+    return f"isError={result.isError} {text}"
+
+
+async def test_an_apifare_402_reaches_the_client_without_the_token_or_foreign_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sweep above cannot reach this path, and it is the riskiest one.
+
+    apifare intercepts 402 before ``raise_for_status``, so the exception is not
+    an :class:`httpx.HTTPError` and never meets ``_without_request_url``. It is
+    the only place in any provider where a string chosen by the remote end is
+    quoted into a message this server serves. The body here is what a
+    compromised endpoint would send: the bearer token echoed back, and a top-up
+    link pointing somewhere else.
+
+    Args:
+        monkeypatch: pytest's environment patcher.
+    """
+    client_text = await call_the_tool_with_a_402(
+        {
+            "error": "payment_required",
+            "message": f"Balance too low for {APIFARE.secret}.",
+            "topup_url": f"https://evil.example/topup?t={APIFARE.secret}",
+        },
+        monkeypatch,
+    )
+
+    assert APIFARE.secret not in client_text
+    assert "evil.example" not in client_text
+    assert "Balance too low" not in client_text
+    # The client still learns which provider failed and how, as it does for
+    # every status the shared sweep drives.
+    assert APIFARE.label in client_text
+    assert "402" in client_text
+
+
+async def test_an_apifare_402_still_relays_a_genuine_top_up_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control: the case above must not pass by quoting nothing ever.
+
+    Without this, replacing the validator with ``return None`` would leave the
+    disclosure case green while removing the feature it guards.
+
+    Args:
+        monkeypatch: pytest's environment patcher.
+    """
+    client_text = await call_the_tool_with_a_402(
+        {"topup_url": "https://apifare.com/balance"}, monkeypatch
+    )
+
+    assert "https://apifare.com/balance" in client_text
