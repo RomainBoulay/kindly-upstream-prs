@@ -101,10 +101,14 @@ from kindly_web_search_mcp_server.scrape import nodriver_worker
 #: that one's reasoning did. The repository already states this rule for doubles
 #: (`make_pinned_detector`); it holds for input pins for the same reason.
 #:
-#: Four of the seven are unreachable while a case passes an explicit executable,
-#: and they are cleared anyway: a case that leaves them alone is a case whose
-#: result depends on what the developer exported, and it would start depending on
-#: it the day the resolver consults the environment first.
+#: The four browser-path entries are unreachable while a case passes an explicit
+#: executable, which every case here does, and they are cleared anyway: a case
+#: that leaves them alone is a case whose result depends on what the developer
+#: exported, and it would start depending on it the day the resolver consults the
+#: environment first. Named by role rather than counted off against the tuple --
+#: `.github/review/rules/python-tests.md` records that prose counts in this suite
+#: go stale, and an earlier draft of this comment said "four of the seven" when
+#: the tuple held six.
 READ_ENVIRONMENT_VARIABLES = (
     "KINDLY_NODRIVER_SANDBOX",
     "KINDLY_NODRIVER_DEVTOOLS_READY_TIMEOUT_SECONDS",
@@ -550,9 +554,9 @@ def test_the_connection_trap_does_not_leak_to_other_doubles() -> None:
     this module. `PooledBrowser._install_connection` assigns a property to
     ``type(self.browser)``, and two review rounds read that as installing onto
     the shared :class:`unittest.mock.NonCallableMagicMock` and leaking to every
-    later mock in the pytest session -- which would make the *other* five cases
-    pass or fail depending on the order they ran in, the worst failure a suite
-    can have.
+    later mock in the pytest session -- which would make every other case in this
+    module pass or fail depending on the order they ran in, the worst failure a
+    suite can have.
 
     It does not leak, because ``create_autospec`` builds a per-mock subclass that
     merely *reuses the name* ``NonCallableMagicMock``. That is genuinely
