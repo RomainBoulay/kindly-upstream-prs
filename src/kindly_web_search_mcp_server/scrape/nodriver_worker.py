@@ -820,9 +820,12 @@ async def _fetch_html(
             return page_targets[0]
 
         try:
-            target_id = await browser.connection.send(
+            # `browser.send` (never `browser.connection`, which nodriver leaves
+            # None) and `new_window=True` (no tabs means no window to put one in)
+            # -- see `.system_design/SYSTEM_DESIGN.md` §1.2 and issue #96.
+            target_id = await browser.send(
                 cdp.target.create_target(
-                    "about:blank", new_window=False, enable_begin_frame_control=True
+                    "about:blank", new_window=True, enable_begin_frame_control=True
                 )
             )
         except Exception as exc:

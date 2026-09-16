@@ -1,0 +1,142 @@
+# System design — kindly-web-search-mcp-server
+
+**Scope of this document today: the pooled-browser lifecycle.** It is
+deliberately partial. `.system_design/` already holds the test suite's design
+(`TEST_SUITE.md`) and its plan; this file is the home for *production* design,
+seeded with the one area that had none and needed it — the contract by which the
+parent process, the Chromium pool and the nodriver worker share a long-lived
+browser. Extend it as work reaches other areas; do not treat an absent section as
+a statement that an area is simple.
+
+---
+
+## 1. Pooled browser lifecycle
+
+### 1.1 The parties
+
+Browser reuse (`KINDLY_NODRIVER_REUSE_BROWSER`, on unless explicitly disabled)
+keeps Chromium alive between `get_content` calls instead of paying a cold start
+per request. Four components share that browser, and each holds an obligation the
+others depend on:
+
+| Component | File | Obligation |
+|---|---|---|
+| Parent fetch | `scrape/universal_html.py` (`fetch_html_via_nodriver`) | Acquire a slot, spawn the worker, restart the slot on a failure that indicates a poisoned browser, release the slot exactly once |
+| Pool | `scrape/chromium_pool.py` (`ChromiumPool`, `ChromiumSlot`) | Launch Chromium, hand out one slot at a time, probe liveness before reuse, terminate on request |
+| Worker | `scrape/nodriver_worker.py` (`_fetch_html`, reuse branch) | Connect to the slot's DevTools endpoint, obtain a page target, navigate, extract, and leave the browser as it found it |
+| Chromium | — | Outlive its last tab, and refuse a tab with no window to put it in |
+
+The worker runs in a **child process**; everything it knows about the slot
+arrives as command-line arguments (`--remote-host`, `--remote-port`,
+`--reuse-browser`, `--user-data-dir`). It never starts or stops the pooled
+browser: `_cleanup(stop_browser=False)` is the reuse path's exit.
+
+### 1.2 Obtaining a page target
+
+`_ensure_reuse_page` (nested in `_fetch_html`) reuses the pooled browser's first
+page target when there is one, and creates one otherwise. Both halves are live:
+
+- **Reuse.** The ordinary first request in a session finds the tab Chromium
+  opened at launch.
+- **Create.** Every request after the first, because `_cleanup` closes the tab
+  it navigated and that was the browser's only page target.
+
+**Why creation goes through `browser.send`:** `nodriver.Browser` subclasses
+`Connection`, and nodriver's own `Browser.get()` sends its `create_target` that
+way. `Browser.connection` is *not* a usable seam — `Browser.__init__` assigns
+`self.connection: Connection = None` and nothing in the package ever reassigns
+it, so `browser.connection.send(...)` raises `AttributeError` on every call.
+Verified against nodriver 0.50.3; the `nodriver>=0.50,<1` ceiling in
+`pyproject.toml` is what guards the claim, and it is nominal.
+
+**Why `new_window=True`:** the create branch is reachable only when there are no
+page targets, and Chromium closes a window when its last tab closes. A
+`Target.createTarget` with `newWindow=false` then has no window to put the tab in
+and is refused with `Failed to open new tab - no browser is open`. Asking for a
+window costs nothing when one exists and is the only form that works when none
+does, so it is unconditional rather than probed — a probe would add a CDP
+round-trip and a second path to guard the one state the branch already knows it
+is in.
+
+**Constraint this creates:** `newWindow` is unsupported by
+`chrome-headless-shell`, which an operator can select through
+`KINDLY_BROWSER_EXECUTABLE_PATH` / `BROWSER_EXECUTABLE_PATH` / `CHROME_BIN` /
+`CHROME_PATH`. **The pooled path requires a full Chrome/Chromium.** The launcher
+passes `--headless=new` (`_build_chromium_launch_args`), which is full headless
+Chrome and supports windows; the constraint is on the binary, not the flag. On a
+headless-shell binary every pooled creation would be refused and the parent would
+restart the slot on every request — reuse would degrade to a cold start per
+request, silently, which is the failure mode issue #96 described.
+
+`enable_begin_frame_control=True` is kept on the call because nodriver's own
+`Browser.get()` sends it and Chrome accepts and ignores it under `--headless=new`
+(measured, Chrome 153). The protocol reference marks it headless-shell-only, so
+it has no consumer here; it stays only to keep the call identical to the
+library's, and removing it would be safe.
+
+### 1.3 Chromium behaviours this design rests on
+
+None of these is in this repository's code, so none can be asserted with the
+browser doubled. Measured on Chrome 153 under `--headless=new` on Windows
+(2026-09-16) and reported on snap Chromium 152.0.7977.64 on Linux in issue #96:
+
+1. Closing the last page target leaves the browser **process alive** and its
+   DevTools HTTP endpoint answering.
+2. `Target.createTarget` with `newWindow=false` and no window open is refused
+   with `Failed to open new tab - no browser is open`.
+3. `newWindow=true` is accepted in that state and leaves no window behind across
+   repeated create-and-close cycles.
+4. A window created this way has the **same viewport** as a tab created inside an
+   existing window — outer 1920x1080, inner 1904x985, from the pool's
+   `--window-size=1920,1080`, with no `width`/`height` passed to
+   `Target.createTarget`. A negative result, recorded because making a dead
+   branch live invites exactly this question: requests 2+ render as request 1 does.
+
+(1) is what makes the pool's health probe insufficient on its own: `ChromiumSlot.
+ensure_started` probes `/json/version`, which answers for a browser with no
+tabs, so a windowless slot is handed out as healthy. That is *correct* given (3)
+— the worker can always make itself a window — but it is the reason the create
+branch must work rather than being a rarely-taken fallback. Should a future
+Chromium exit on last-tab-close instead, the probe sees `proc.returncode is not
+None` and relaunches silently, and reuse again degrades to a cold start per
+request with no error anywhere. A `chromium`-lane test asserting browser-pid
+stability across two pooled fetches is the check that would catch it;
+`TEST_SUITE.md` §9 carries that gap.
+
+### 1.4 Failure handling, and what the string list really covers
+
+The parent decides whether a worker failure poisoned the browser by matching a
+fixed list of substrings against the exception's whole `__cause__`/`__context__`
+chain (`_pool_error_requires_restart`). On a match it terminates the slot,
+releases it, re-acquires and re-runs the worker exactly once.
+
+**The worker's own wording is not load-bearing, and it is worth knowing why
+not.** The worker is a *subprocess*: `_run_worker_command` turns any nonzero exit
+into `RuntimeError(f"nodriver worker failed (exit={rc}): {stderr_tail}")`, and
+`"nodriver worker failed"` is the first pattern in the list. So every worker-side
+failure matches on the wrapper alone, whatever the worker said. The
+message-specific patterns — `"failed to create pooled target"`, `"no browser is
+open"`, `"failed to open new tab"` — are **defence in depth**, covering the same
+strings arriving by some other route. Renaming a worker message therefore
+degrades diagnosis, not recovery.
+
+What *does* escape the list is a failure with **no message**. See the gap below.
+
+**Known gap — the timeout path leaves a tab behind.** When the parent kills a
+timed-out worker, `_cleanup` never runs and the navigated tab survives in the
+pooled browser. `asyncio.TimeoutError` carries an empty message, so it matches
+none of the patterns and the slot is released untouched; the next request then
+takes that tab and inherits the previous request's live document. With pool size
+1 and a page that blocks `Page.navigate`, the slot can stay wedged. Accepted for
+now — classifying the timeout would change recovery behaviour well beyond the
+create-a-target defect that surfaced it — and recorded here so it is not
+rediscovered as a new bug.
+
+### 1.5 What reuse deliberately does not isolate
+
+`.github/review/rules/scrape-browser.md` already states that a reused browser
+carries state. Precisely: closing the tab discards **that document** and its
+timers and in-flight requests; cookies, storage and service-worker registrations
+live in the slot's profile directory and survive every request the slot serves.
+A new window is not a new profile. `Target.createBrowserContext` is the lever if
+per-request isolation is ever wanted, and nothing uses it today.
