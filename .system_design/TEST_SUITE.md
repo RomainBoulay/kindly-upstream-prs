@@ -3084,6 +3084,7 @@ The **Today** column describes *test coverage*, not implementation status.
 | Worker command shape, pooled and unpooled | covered (E2-2) | L1 | `fast` | |
 | Worker lifecycle and cleanup | gap — stale | L3 portable | `subsystem` | |
 | Worker retry/termination orchestration | covered — unmarked, see §5.2 | L3 portable | `subsystem` (open) | |
+| Pooled target creation (worker reuse branch) | covered (issue #96) — `test_worker_pooled_target.py` pins `browser.send` and `new_window=True`; the three Chromium behaviours it rests on are measured, not tested (`SYSTEM_DESIGN.md` §1.3) | L1 + L4 gap | `fast` (+ `chromium`, not run) | |
 | ChromiumPool | gap — no tests | L3 Chromium | `chromium` | |
 | CLI entrypoints and `--` forwarding | covered | L1 | `fast` | |
 | Wheel build, install, console entrypoints | gap | L4 | `package` | |

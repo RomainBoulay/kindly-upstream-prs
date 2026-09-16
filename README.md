@@ -873,6 +873,7 @@ Container will be built at the first run. To rebuild it, append `--build` to the
   - Optional: `KINDLY_NODRIVER_PORT_RANGE=45000-45100` restricts remote debugging ports.
   - Pooled slots are health-checked before use and auto-restarted if the DevTools endpoint is stale (diagnostics emit `pool.slot_probe` and `pool.slot_restart`).
   - If pool acquisition times out or fails, the server falls back to per-request Chromium and emits a `pool.acquire_timeout`/`pool.slot_error` diagnostic when diagnostics are enabled.
+  - A request that times out or is cancelled has its browser killed mid-page, so that slot is recycled rather than reused: the request still fails with its own timeout, and the *next* request gets a freshly launched Chromium (diagnostics emit `pool.slot_recycled`). Repeated `pool.slot_recycled` records mean reuse is paying a cold start per request — raise `KINDLY_TOOL_TOTAL_TIMEOUT_SECONDS` or `KINDLY_HTML_TOTAL_TIMEOUT_SECONDS` rather than the pool settings.
 - Need deeper debugging? Enable diagnostics:
   - Set `KINDLY_DIAGNOSTICS=1` to emit JSON-line diagnostics to stderr and include `diagnostics` in tool responses.
   - `get_content` returns top-level `diagnostics`; `web_search` attaches `diagnostics` per result.

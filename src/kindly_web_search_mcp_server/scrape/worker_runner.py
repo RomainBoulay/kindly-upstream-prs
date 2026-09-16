@@ -1125,6 +1125,41 @@ async def _terminate_process_tree(proc: WorkerProcess) -> None:
         await proc.wait()
 
 
+def _worker_was_killed(exc: BaseException) -> bool:
+    """Report whether an exception means this module killed the worker's tree.
+
+    :func:`_run_worker_command` ends a run in one of two ways. Either the child
+    exits on its own — cleanly, or with a nonzero status this module wraps in a
+    :class:`RuntimeError` — or it outlives its budget or its caller, and then
+    ``_terminate_process_tree`` kills it and the original exception is re-raised.
+    Only the second kind leaves the child no chance to run its own cleanup.
+
+    A caller cannot tell those apart from the exception text: ``TimeoutError``
+    from :func:`asyncio.wait_for` carries an empty message, and
+    ``CancelledError`` derives from :class:`BaseException`, so it never reaches
+    an ``except Exception``. It is a *type* question, and the answer belongs
+    here rather than at the call site, because this is the module that does the
+    killing — and because ``scrape/universal_html.py`` is held by
+    `tests/test_worker_runner.py::test_universal_html_manages_no_subprocess` to
+    importing neither ``asyncio`` nor ``subprocess``, so it could not name these
+    types even if it wanted to.
+
+    The pooled caller needs this: a killed worker leaves the tab it navigated
+    open in a browser the pool will hand to somebody else. See
+    ``.system_design/SYSTEM_DESIGN.md`` §1.4.
+
+    Args:
+        exc: The exception a :func:`_run_worker_command` call raised.
+
+    Returns:
+        ``True`` when the worker was killed mid-run, ``False`` when it was
+        allowed to exit and therefore ran its own cleanup.
+    """
+    # Spelled through `asyncio` even though `asyncio.TimeoutError` has been the
+    # builtin since 3.11, so the pair reads as the two handlers it mirrors.
+    return isinstance(exc, (asyncio.TimeoutError, asyncio.CancelledError))
+
+
 async def _run_worker_command(
     command: list[str],
     *,
