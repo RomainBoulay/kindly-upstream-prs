@@ -833,11 +833,6 @@ class TestSelectRules(unittest.TestCase):
     # silence.
     FORWARD_LOOKING_LITERALS = frozenset(
         {
-            # There is no `.dockerignore` today, so the `Dockerfile` builds from
-            # a context containing everything -- including `.env` if a developer
-            # has one. `packaging.md` treats adding one as an improvement; the
-            # pattern is here so the day it lands it is reviewed.
-            ".dockerignore",
             # 🔴 `CLAUDE.md` is in this repository's `.gitignore`, so it is
             # untracked BY DESIGN rather than merely absent. The pattern stays
             # because a decision to start tracking it should not also silently

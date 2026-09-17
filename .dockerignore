@@ -1,0 +1,28 @@
+# What the image build is allowed to see.
+#
+# 🔴 **An allowlist, not a denylist, and that is the point.** `Dockerfile` copies
+# exactly three paths -- `pyproject.toml`, `README.md` and `src/`. A denylist has
+# to be extended every time the tree grows a directory that is not one of them,
+# and nothing fails when it is not extended: the build still succeeds, just with
+# more in the context. That is why this class of file rots. `*` plus three
+# negations inverts the default -- a new top-level directory is excluded the day
+# it lands -- and the one failure mode left is loud, a `COPY` of something not
+# named below stopping the build rather than an unwanted file silently shipping.
+#
+# `README.md` is not optional: `pyproject.toml` declares `readme = "README.md"`,
+# so hatchling fails the wheel build without it.
+#
+# What this keeps out of the daemon, and out of any layer a future `COPY` would
+# create, in the order `.github/review/rules/packaging.md` names them: `.env`,
+# `.git` and a local virtualenv. `.git` is the whole history, including anything
+# ever committed and later removed. `.venv/` and `tests/` are the two largest
+# trees here and neither is read by the build.
+#
+# Deliberately not leaning on `.gitignore`: Docker does not read it, so every
+# untracked `.venv/`, `__pycache__/`, `.pytest_cache/` and `htmlcov/` was part of
+# the context until this file existed.
+*
+
+!pyproject.toml
+!README.md
+!src
