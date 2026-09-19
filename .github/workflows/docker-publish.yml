@@ -45,8 +45,12 @@ name: Build and publish Docker image
 #   include it, so on its own it blocks no merge -- recorded as one of exactly two
 #   such jobs in `JOBS_OUTSIDE_THE_REQUIRED_AGGREGATE`. It is also the only shape a
 #   fork can run, because nothing on that path needs a credential.
-#   ⚠️ Not a full rehearsal of publishing: `push:` is false here, so the
-#   attestation and cache-export paths below run only on the triggers above.
+#   ⚠️ Not a full rehearsal of publishing, and precisely which parts differ is
+#   worth getting right: `push:` is false here, so nothing reaches the registry
+#   and `cache-to:` is skipped. The provenance attestation is **still generated**
+#   -- `provenance:` below is an unconditional input, and run 35456340639's build
+#   command carries `--attest type=provenance,mode=max` on this very path. What a
+#   pull request does not rehearse is publication, not attestation.
 # - `workflow_dispatch`: a manual rebuild, for a base image or OS package update
 #   that no commit here triggers. It builds with `no-cache:` for that reason -- the
 #   `apt-get` layer is keyed on the base image digest and the command, so a cached
@@ -106,11 +110,17 @@ jobs:
     # **Measured.** Not every cap here is -- `ci-required` declares 10 minutes on
     # the reasoning that it starts a shell and exits -- but this is the
     # repository's longest-running job by far, so a figure is worth more than an
-    # argument. Run 35434307949, the first on this branch: whole job 5m49s, the
-    # build step itself 5m26s, on a COLD cache with nothing to restore. The
-    # emulated arm64 leg dominates it: `apt-get install chromium` took ~20s on
-    # amd64 and ~2m30s on arm64. Roughly ten times the headroom, so the number is
-    # a safety net and not a bet. If a later run approaches it, the native
+    # argument. Two runs, both on the PULL-REQUEST path -- run 35434307949, the
+    # first on this branch, whole job 5m49s with the build step 5m26s on a cold
+    # cache; and run 35456340639, build step 5m30s. The emulated arm64 leg
+    # dominates both: `apt-get install chromium` took ~20s on amd64 and ~2m30s on
+    # arm64.
+    #
+    # ⚠️ **Both figures are the pull-request path**, which pushes nothing and
+    # exports no cache, so they are the floor of this job's work rather than its
+    # slowest shape. With roughly ten times the headroom that changes no
+    # decision, but the next person to compare against a `main` run should know
+    # which path these came from. If a later run approaches the cap, the native
     # `ubuntu-24.04-arm` shape weighed in the header is the trade to revisit,
     # not this number.
     timeout-minutes: 60

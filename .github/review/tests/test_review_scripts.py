@@ -150,9 +150,9 @@ EXPECTED_JOBS = {
     ("ci.yml", "ci-required"),
     ("tests-broad.yml", "broad"),
     ("claude-code-review.yml", "review"),
-    # Publishes the container image. It gates no merge -- nothing `needs:` it and it
-    # feeds no aggregate -- but the sweep below globs rather than enumerates, so it
-    # is checked for a declared cap either way and belongs in the record.
+    # Publishes the container image. Whether it feeds the aggregate is recorded
+    # once, in :data:`JOBS_OUTSIDE_THE_REQUIRED_AGGREGATE`, rather than argued
+    # again here: two records of one fact is what this set stopped being.
     ("docker-publish.yml", "build-and-push"),
 }
 
@@ -556,6 +556,16 @@ def _step_block(text: str, name: str) -> str | None:
     declaring no ``if:`` of its own acquires the following step's condition and a
     guard pairing the two reports an agreement that is not there.
 
+    🔴 **The bound is the next LIST ITEM, not the next ``- name:``.** The first
+    draft ended the slice at `^      - name:` and was measured going hollow: a
+    step written `- uses: …` with no `name:` is invisible to that pattern, so the
+    named step above it swallowed the next one whole. Moving the login step's
+    `if:` down onto a following name-less step then left
+    :class:`PublishConditionIsPairedTests` green while the workflow logged in to
+    the registry on every pull request. Name-less steps are this repository's
+    ordinary style -- `ci.yml` and `tests-broad.yml` are full of them -- so this
+    was not a hypothetical shape.
+
     Args:
         text: The whole workflow file.
         name: The step's ``name:`` value, matched exactly.
@@ -569,7 +579,7 @@ def _step_block(text: str, name: str) -> str | None:
     if opening is None:
         return None
     tail = text[opening.end() :]
-    following = re.search(r"^      - name:", tail, re.M)
+    following = re.search(r"^      - \S", tail, re.M)
     return tail[: following.start()] if following else tail
 
 
@@ -599,10 +609,12 @@ def _condition(expression: str) -> str:
 def _dockerfile_stages(text: str) -> int:
     """Return how many build stages a ``Dockerfile`` declares.
 
-    Counts ``FROM`` at the start of a line, case-insensitively: Docker accepts
-    any casing for an instruction, and a counter understanding only the
-    conventional one reads a lowercase multi-stage file as single-stage -- the
-    direction that passes.
+    Counts ``FROM`` at the start of a line, case-insensitively and tolerating
+    leading whitespace: Docker accepts any casing for an instruction and ignores
+    indentation before it, and a counter understanding only the conventional
+    spelling reads a lowercase *or indented* multi-stage file as single-stage --
+    the direction that passes. Both shapes were measured surviving an earlier
+    draft of this function.
 
     Args:
         text: The whole ``Dockerfile``.
@@ -611,7 +623,7 @@ def _dockerfile_stages(text: str) -> int:
         The number of ``FROM`` instructions.
     """
 
-    return len(re.findall(r"^FROM[ \t]", text, re.M | re.I))
+    return len(re.findall(r"^[ \t]*FROM[ \t]", text, re.M | re.I))
 
 
 REVIEW_DIR = Path(__file__).resolve().parents[1]
@@ -3883,7 +3895,7 @@ class TestInterpolationGuardItself(unittest.TestCase):
 INTERPRETER = r'"?\$\{?pythonLocation\}?/bin/python3?"?'
 
 
-def _workflow_step_script(step_name: str, path=None) -> str:
+def _workflow_step_script(step_name: str, path: Path | None = None) -> str:
     """Extract a step's ``run:`` block verbatim from the real workflow file.
 
     Testing the shell the workflow actually runs, rather than a copy of it, is
@@ -11892,22 +11904,36 @@ class PublishConditionIsPairedTests(unittest.TestCase):
             "put an unreviewed build in the registry under a `pr-<n>` tag",
         )
 
+    #: Build-step inputs keyed to *publishing*, as opposed to keyed to some other
+    #: event. Enumerated rather than swept, because a sweep cannot tell them
+    #: apart: `no-cache:` also tests `github.event_name`, but against
+    #: `workflow_dispatch`, and a guard demanding one predicate everywhere would
+    #: report a correct line as wrong. The control below pins that distinction so
+    #: this tuple cannot quietly absorb it.
+    PUBLISHING_KEYS = ("push", "cache-to")
+
     def test_every_line_keyed_to_the_publishing_path_uses_the_same_predicate(self):
         """🔴 Three lines, not two, and the third is easy to forget.
 
         `cache-to:` is keyed to the same event as `push:` and the login `if:` --
         `rules/ci.md` argues for it at length -- so a change to "when does this
         workflow publish" has three sites and a pair check would bless two of
-        them. Asserted over the whole build step rather than per key, so a fourth
-        site added later is covered the day it lands.
+        them.
+
+        ⚠️ Checked per key against :data:`PUBLISHING_KEYS`, over the whole file.
+        A fourth publishing-keyed input added later is **not** covered
+        automatically: it has to be added to that tuple, which is the price of
+        being able to tell it apart from `no-cache:`.
         """
 
         text = self._text()
         predicate = "github.event_name != 'pull_request'"
-        for key in ("push", "cache-to"):
+        for key in self.PUBLISHING_KEYS:
             with self.subTest(key=key):
                 found = re.search(
-                    rf"^          {re.escape(key)}:[ \t]*(\S.*?)[ \t]*$", text, re.M
+                    rf"^          {re.escape(key)}:[ \t]*(\S.*?)[ \t]*(?:#.*)?$",
+                    text,
+                    re.M,
                 )
                 self.assertIsNotNone(found, f"the build step declares no `{key}:`")
                 self.assertIn(
@@ -11917,6 +11943,23 @@ class PublishConditionIsPairedTests(unittest.TestCase):
                     "the login step's `if:` have to move together or the "
                     "workflow does half of publishing",
                 )
+
+    def test_the_manual_rebuild_is_keyed_to_a_different_event_on_purpose(self):
+        """🔴 The control that keeps the tuple above honest.
+
+        `no-cache:` reads `github.event_name` too, and it must NOT carry the
+        publishing predicate: it is true for `workflow_dispatch`, which is how a
+        manual rebuild refuses the stale `apt-get` layer. If somebody ever
+        "fixes" the case above by sweeping every `github.event_name` line, this
+        is what stops it.
+        """
+
+        found = re.search(
+            r"^          no-cache:[ \t]*(\S.*?)[ \t]*(?:#.*)?$", self._text(), re.M
+        )
+        self.assertIsNotNone(found, "the build step declares no `no-cache:`")
+        self.assertIn("workflow_dispatch", found.group(1))
+        self.assertNotIn("pull_request", found.group(1))
 
     def test_the_normaliser_does_not_make_different_conditions_look_equal(self):
         """🔴 The control. A normaliser returning a constant passes everything.
@@ -11945,11 +11988,29 @@ class PublishConditionIsPairedTests(unittest.TestCase):
         An unbounded slice hands the login step the *build* step's keys, so both
         conditions this class compares would come from one line and agree with
         themselves no matter what the file said.
+
+        🔴 **The name-less case is the one that was actually hollow**, and it is
+        checked against a synthetic file rather than against this repository's
+        own, which happens to name every step in `docker-publish.yml`. Measured:
+        with the bound at `^      - name:`, deleting the login step's `if:` and
+        putting it on a name-less step below left every case in this class green
+        while the workflow authenticated on every pull request.
         """
 
         block = _step_block(self._text(), self.LOGIN_STEP)
         self.assertNotIn("docker/build-push-action", block)
         self.assertIn("docker/login-action", block)
+
+        synthetic = (
+            "jobs:\n"
+            "  j:\n"
+            "    steps:\n"
+            "      - name: First\n"
+            "        uses: a/b@v1\n"
+            "      - uses: c/d@v1\n"
+            "        if: github.event_name != 'pull_request'\n"
+        )
+        self.assertNotIn("c/d@v1", _step_block(synthetic, "First"))
 
 
 class PublishedPlatformsArePinnedTests(unittest.TestCase):
@@ -12133,10 +12194,18 @@ class ReadmeNamesThePublishedImageTests(unittest.TestCase):
         self.assertTrue(paths, "README names no GHCR image at all")
         for path in sorted(paths):
             with self.subTest(path=path):
-                self.assertTrue(
-                    path.startswith(expected),
+                # 🔴 Equality, not `startswith`. Measured: with a prefix
+                # test, renaming every README path to `...-server-v2` while
+                # leaving the build context alone stayed green -- and a suffixed
+                # rename is the most likely shape of the drift this class exists
+                # to catch. The capture stops at `:` and `@`, so the tag and
+                # digest forms both reduce to the bare path and equality is the
+                # right comparison.
+                self.assertEqual(
+                    path,
+                    expected,
                     f"README tells a reader to pull {path!r}, but the repository "
-                    f"its own links point at publishes to {expected!r}",
+                    f"its own build context names publishes to {expected!r}",
                 )
 
     def test_the_slug_is_read_and_not_assumed(self):
@@ -12244,6 +12313,7 @@ class CacheModeMatchesTheBuildTests(unittest.TestCase):
             2,
         )
         self.assertEqual(_dockerfile_stages("from a AS build\nFROM b\n"), 2)
+        self.assertEqual(_dockerfile_stages("FROM a AS build\n FROM b\n"), 2)
         self.assertEqual(
             _dockerfile_stages("# FROM a\nFROM b\nCOPY --from=x /y /z\n"), 1
         )
@@ -12356,18 +12426,36 @@ class VersionTagIsDerivedTests(unittest.TestCase):
             "declared in `pyproject.toml` and must be read from there, or the two "
             "drift the first time the package version moves",
         )
+        # 🔴 The step's OWN `id:`, not the literal `version`. Measured: renaming
+        # `id: version` to `id: pkg_version` and leaving the tag line alone left
+        # this class green, and CI would then have published
+        # `type=raw,value=` -- the blank tag the step's emptiness check exists to
+        # prevent, arriving by the one route that check cannot see. The `id:` and
+        # the reference to it are two halves of one link, so they are read
+        # together.
+        block = _step_block(text, self.STEP)
+        self.assertIsNotNone(block, f"no step named {self.STEP!r}")
+        step_id = re.search(r"^        id:[ \t]*(\S+)[ \t]*$", block, re.M)
+        self.assertIsNotNone(
+            step_id,
+            f"the {self.STEP!r} step declares no `id:`, so nothing can reference "
+            "its output and the version tag resolves to an empty string",
+        )
         # Anchored to the tag line rather than searched for in the file: a
         # mention in a comment is not a tag, and this file comments heavily.
         found = re.search(
-            r"^            type=raw,value=\$\{\{ steps\.version\.outputs\.version "
-            r"\}\}(.*)$",
+            r"^            type=raw,value=\$\{\{ steps\."
+            + re.escape(step_id.group(1))
+            + r"\.outputs\.version \}\}(.*)$",
             text,
             re.M,
         )
         self.assertIsNotNone(
             found,
-            "no tag is derived from the version step's output, so the image "
-            "carries no tag naming the package version it contains",
+            f"no tag reads `steps.{step_id.group(1)}.outputs.version`, which is "
+            f"the id the {self.STEP!r} step actually declares. A tag referencing "
+            "some other id resolves to an empty string, and `metadata-action` is "
+            "handed a tag with no value",
         )
         self.assertIn(
             "enable={{is_default_branch}}",
@@ -12414,10 +12502,17 @@ class PublishSurfaceIsDeclaredTests(unittest.TestCase):
             r"^    permissions:\n((?:^      \S.*\n)+)", self._text(), re.M
         )
         self.assertIsNotNone(found, "the job declares no `permissions:` block")
-        granted = {
-            line.split(":")[0].strip(): line.split(":")[1].split("#")[0].strip()
-            for line in found.group(1).splitlines()
-        }
+        # ⚠️ Comment lines are STEPPED OVER rather than parsed. Measured:
+        # with a dict comprehension over every matched line, moving one trailing
+        # `# actions/checkout` onto its own line raised `IndexError` instead of
+        # printing the message below -- so an ordinary edit in a heavily
+        # commented file replaced the diagnosis with a traceback.
+        granted = {}
+        for line in found.group(1).splitlines():
+            if line.strip().startswith("#"):
+                continue
+            key, _, value = line.partition(":")
+            granted[key.strip()] = value.split("#")[0].strip()
         self.assertEqual(
             granted,
             {"contents": "read", "packages": "write"},
@@ -12438,6 +12533,43 @@ class PublishSurfaceIsDeclaredTests(unittest.TestCase):
         text = self._text()
         self.assertIn("concurrency:", text, "the workflow declares no concurrency group")
         self.assertIn("cancel-in-progress: true", text)
+
+    def test_the_attestation_mode_is_a_decision_rather_than_a_default(self):
+        """🔴 Deleting one line restores a default keyed to repository visibility.
+
+        With no `provenance:` input the action chooses `mode=max` on a public
+        repository and `mode=min,inline-only` on a private one, so the same file
+        would mean different things depending on a setting outside it. That
+        conditional default is the entire reason the line exists; its absence is
+        invisible from a green run, because the build still succeeds either way.
+        """
+
+        self.assertRegex(
+            self._text(),
+            re.compile(r"^          provenance: \S+", re.M),
+            "`provenance:` is no longer declared, so what this job attests is "
+            "decided by the repository's visibility rather than by this file",
+        )
+
+    def test_latest_is_limited_to_the_default_branch(self):
+        """The other half of `flavor: latest=false`, and easy to lose alone.
+
+        `latest=false` stops the *action's* default from moving `:latest` on a
+        tag push; this stops the explicit `type=raw` line from doing the same.
+        README documents `:latest` as the newest build of the default branch, so
+        both halves have to hold for that sentence to be true.
+        """
+
+        found = re.search(
+            r"^            type=raw,value=latest(.*)$", self._text(), re.M
+        )
+        self.assertIsNotNone(found, "no `type=raw,value=latest` tag is declared")
+        self.assertIn(
+            "enable={{is_default_branch}}",
+            found.group(1),
+            "`:latest` is no longer limited to the default branch, so a `v*` tag "
+            "push or a `workflow_dispatch` from a feature branch would move it",
+        )
 
     def test_latest_does_not_move_on_a_tag_push(self):
         """`flavor: latest=false` is one line and `:latest` is what readers pull.
@@ -12495,11 +12627,6 @@ class AggregateExemptionIsRecordedTests(unittest.TestCase):
         """
 
         text = self.CI.read_text(encoding="utf-8")
-        needs = re.search(r"^    needs: \[(.+)\]$", text, re.M)
-        self.assertIsNotNone(needs, "the aggregate declares no flow-style `needs:`")
-        names = {item.strip() for item in needs.group(1).split(",")}
-
-        gated = {(self.CI.name, self.AGGREGATE)}
         section = _jobs_section(text)
         marks = [
             (m.group(1), m.start())
@@ -12507,19 +12634,53 @@ class AggregateExemptionIsRecordedTests(unittest.TestCase):
                 r"^  ([A-Za-z_][A-Za-z0-9_-]*):[ \t]*$", section, re.M
             )
         ]
-        for index, (name, start) in enumerate(marks):
-            if name not in names:
+        bodies = {
+            name: section[start : (marks[i + 1][1] if i + 1 < len(marks) else len(section))]
+            for i, (name, start) in enumerate(marks)
+        }
+
+        # 🔴 The AGGREGATE's own `needs:`, found inside its job body. Measured:
+        # an unanchored `^    needs: \[` over the whole file reads whichever job
+        # declares one first, and giving `review_replies` a `needs:` of its own
+        # made this resolver report `broad` and the repository's entire test
+        # suite as ungated -- with a message telling the maintainer to record
+        # them as gating no merge, which is the outcome
+        # `test_the_resolver_reaches_through_a_caller` exists to prevent.
+        self.assertIn(self.AGGREGATE, bodies, f"`ci.yml` declares no {self.AGGREGATE}")
+        needs = re.search(r"^    needs: \[(.+)\]$", bodies[self.AGGREGATE], re.M)
+        self.assertIsNotNone(needs, "the aggregate declares no flow-style `needs:`")
+
+        gated = {(self.CI.name, self.AGGREGATE)}
+        # Followed transitively: a dependency may itself declare `needs:`, and a
+        # resolver that read only the aggregate's own list would report the far
+        # end of a two-link chain as ungated.
+        pending = [item.strip() for item in needs.group(1).split(",")]
+        while pending:
+            name = pending.pop()
+            if (self.CI.name, name) in gated or name not in bodies:
                 continue
             gated.add((self.CI.name, name))
-            end = marks[index + 1][1] if index + 1 < len(marks) else len(section)
+            body = bodies[name]
+            onward = re.search(r"^    needs: \[(.+)\]$", body, re.M)
+            if onward is not None:
+                pending.extend(item.strip() for item in onward.group(1).split(","))
             called = re.search(
-                r"^    uses:[ \t]*\./\.github/workflows/(\S+?)[ \t]*$",
-                section[start:end],
-                re.M,
+                r"^    uses:[ \t]*\./\.github/workflows/(\S+?)[ \t]*$", body, re.M
             )
             # A gated caller gates everything in the workflow it calls.
             if called is not None:
                 target = WORKFLOW_DIR / called.group(1)
+                # ⚠️ Checked rather than left to raise. Measured: a caller
+                # pointing at a file that does not exist -- a rename, a `.yaml`
+                # for a `.yml` -- came out of here as a bare `FileNotFoundError`
+                # from two frames down, which is a traceback where this suite
+                # promises a diagnosis.
+                self.assertTrue(
+                    target.is_file(),
+                    f"`{self.CI.name}`'s `{name}` job calls "
+                    f"`{called.group(1)}`, which does not exist. Every job that "
+                    "workflow declares is currently counted as gating no merge",
+                )
                 gated.update(
                     (target.name, job["job"]) for job in _declared_jobs(target)
                 )

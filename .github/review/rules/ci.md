@@ -263,6 +263,24 @@ spend question back.
   to make the build faster stops publishing for those users without anything going
   red. A change that does it should say so. Adding one only works where the base
   image and Debian's `chromium` both exist for that architecture.
+  `PublishedPlatformsArePinnedTests` pins the set and holds README to naming the
+  same architectures, so adding one stays red until the README line tells those
+  users the image is now for them.
+- **README's registry paths are paired to the repository.** The image name is
+  `${{ github.repository }}`, resolved at run time, so it appears nowhere in the
+  tree while README writes it out three times.
+  `ReadmeNamesThePublishedImageTests` compares every `ghcr.io/` path against the
+  repository README's own Compose build context names.
+- **`permissions:`, the `concurrency` group and `flavor: latest=false` are each one
+  line whose loss is invisible from a green run**, so `PublishSurfaceIsDeclaredTests`
+  reads all three, plus `provenance:` and the `enable={{is_default_branch}}` on the
+  `latest` tag.
+- **This job is one of exactly two that no `ci-required` run waits on.**
+  `JOBS_OUTSIDE_THE_REQUIRED_AGGREGATE` records both — the other is this file's own
+  review job — and `AggregateExemptionIsRecordedTests` fails when a third appears
+  without being recorded. Note what that set is *not*: what actually blocks a merge
+  is branch protection, which no file here can read, so the set is measured against
+  the aggregate and not against "the merge gate".
 - 🔴 **`cache-to` runs only on the publishing triggers, and the reason is scope, not
   permissions.** A pull request *can* write the cache. What it cannot do is write
   somewhere another run will read it, because the entry belongs to that pull

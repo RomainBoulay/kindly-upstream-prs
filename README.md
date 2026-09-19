@@ -756,9 +756,10 @@ docker pull ghcr.io/shelpuk-ai-technology-consulting/kindly-web-search-mcp-serve
 > visibility, and there is no API for it. A maintainer has to open the package's
 > **Package settings** once and set visibility to Public.
 
-Tags `latest` and `<version>` (for example `0.1.9`, matching `pyproject.toml`)
-both track the newest build of the default branch, so they **move**. Pin the
-`@sha256:` digest when you need a build that never changes.
+Two tags track the newest build of the default branch and therefore **move**:
+`latest`, and the package version the image contains (the `version` in
+`pyproject.toml`). Pin the `@sha256:` digest when you need a build that never
+changes.
 
 Run it the same way as a locally built image — just use the full name:
 
