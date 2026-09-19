@@ -738,19 +738,40 @@ Whether you can run the MCP server on a different PC depends on your MCP client:
 
 ### Prebuilt image (GHCR)
 
-Pull the image instead of building it. It runs on Intel/AMD and on ARM machines
-such as an Apple Silicon Mac or an ARM server:
+Pull the image instead of building it. It is published for Intel/AMD
+(`linux/amd64`) and ARM (`linux/arm64`) — so it runs on ordinary servers and PCs,
+on an Apple Silicon Mac, and on ARM cloud instances:
 
 ```bash
-# Newest build:
+# Newest build of the default branch:
 docker pull ghcr.io/shelpuk-ai-technology-consulting/kindly-web-search-mcp-server:latest
 
 # Or one build that never changes, using its digest from the package page:
 docker pull ghcr.io/shelpuk-ai-technology-consulting/kindly-web-search-mcp-server@sha256:<digest>
 ```
 
-Run it exactly like the image you build below, using the full name above wherever
-that section writes `kindly-web-search-mcp-server`.
+> **If `docker pull` says `denied` or `unauthorized`**, the package is still
+> private. GitHub creates a new container package as private even under a public
+> repository — a package inherits the repository's permissions but not its
+> visibility, and there is no API for it. A maintainer has to open the package's
+> **Package settings** once and set visibility to Public.
+
+Tags `latest` and `<version>` (for example `0.1.9`, matching `pyproject.toml`)
+both track the newest build of the default branch, so they **move**. Pin the
+`@sha256:` digest when you need a build that never changes.
+
+Run it the same way as a locally built image — just use the full name:
+
+```bash
+docker run --rm -p 8000:8000 \
+  -e SERPER_API_KEY="..." \
+  -e GITHUB_TOKEN="..." \
+  ghcr.io/shelpuk-ai-technology-consulting/kindly-web-search-mcp-server \
+  --http --host 0.0.0.0 --port 8000
+```
+
+See the section below for the other environment variables and the allowlist
+caveats — they apply identically to the prebuilt image.
 
 ### Docker (Streamable HTTP)
 

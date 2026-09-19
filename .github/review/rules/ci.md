@@ -233,12 +233,32 @@ spend question back.
   permission, or uses a personal access token where the built-in `GITHUB_TOKEN`
   works, it should say what the token can now do that the job could not do before.
 - 🔴 **The login step skips pull requests on purpose.** Nothing is pushed on that
-  path, so logging in there would authenticate for work that never happens. A pull
-  request from a fork does get a `GITHUB_TOKEN`, but a read-only one, so
-  `packages: write` is reduced to read and a push would fail anyway. Deleting that
-  `if:`, or pushing on the pull-request path, is a finding. Those two lines only
-  work as a pair, so read them together: `push:` on the build step, and the `if:`
-  on the login step.
+  path, so logging in there would authenticate for work that never happens.
+  Deleting that `if:`, or pushing on the pull-request path, is a finding.
+  ⚠️ **Read the usual reassurance carefully, because it is narrower than it
+  sounds.** A pull request from a **fork** gets a read-only `GITHUB_TOKEN`, so
+  `packages: write` is reduced to read and a push fails regardless — but a pull
+  request from a **branch in this repository** gets the declared `packages: write`,
+  and this repository takes both shapes. For the branch shape the `push:`
+  expression is the only thing standing between a pull request and a publish, and
+  `docker/build-push-action` defaults `push` to false, so deleting it stops
+  publishing silently and green. `PublishConditionIsPairedTests` now pairs the two
+  lines and pins the predicate; a change that weakens or deletes that guard to
+  make an edit pass is a critical finding.
+- **Three lines are keyed to the publishing path, not two.** `push:`, the login
+  `if:`, and `cache-to:` all carry `github.event_name != 'pull_request'`. A change
+  to "when does this publish" has to move all three or the workflow does half of
+  publishing.
+- **`provenance:` is declared rather than defaulted.** Left unset, the action
+  picks a mode from the repository's *visibility*, so the same file would mean
+  different things on a public and a private repository. What the job publishes
+  besides the image — attestation manifests, which the package page shows as
+  `unknown/unknown` rows, and the full build environment under `mode=max` — is
+  part of the change, and a pull request that flips it should say which it wants.
+- **The version tag is read from `pyproject.toml`, never written here.** A literal
+  version in the workflow is a second place to bump. `VersionTagIsDerivedTests`
+  runs the extraction step against the real file, so a `sed` that silently yields
+  nothing is red rather than a blank tag on the package page.
 - **`platforms:` lists every architecture the image is published for.** Removing one
   to make the build faster stops publishing for those users without anything going
   red. A change that does it should say so. Adding one only works where the base
@@ -251,6 +271,12 @@ spend question back.
   pull requests trades away the default branch's older layers for entries only a
   re-run of the same pull request could use. A change that turns it on everywhere
   should say what it expects to gain.
+- **`mode=min` is paired to the `Dockerfile`'s stage count, not chosen by taste.**
+  `max` exports intermediate layers, which only pays off on a multi-stage build;
+  this `Dockerfile` has one `FROM`, so the two modes export the same layers and
+  `max` just spends more of the 10 GB. `CacheModeMatchesTheBuildTests` fails if a
+  second `FROM` lands without the mode moving with it, and a pull request that
+  wants `max` over a single stage has to change that case and say why.
 - The 60-minute limit fits under `ubuntu-latest`'s ceiling of 360, and it is the same
   limit `tests-broad.yml`'s matrix and the review job use. It is a safety net rather
   than a budget, and not a claim about which job is slowest: the arm64 half runs

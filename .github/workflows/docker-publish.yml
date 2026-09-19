@@ -31,13 +31,22 @@ name: Build and publish Docker image
 #
 # **What each trigger does.**
 #
-# - `push` to the default branch, and `v*` tags: build and push. The tag list below
-#   is what produces `:latest`, `:main`, `:sha-<short>` and the version tags.
+# - `push` to the default branch: build and push. The tag list below is what
+#   produces `:latest`, `:main`, `:sha-<short>` and `:<package version>`.
+# - `push` of a `v*` tag: build and push the `type=semver` tags. ⚠️ **Nothing
+#   produces such a tag today** -- this repository has no tags and no releases, so
+#   that half has never fired. It is kept rather than deleted because a release
+#   process is the intended direction, and the version tag on the default-branch
+#   path is what gives the image a version identity until then. Starting to
+#   release means tagging `v<version>` to match `pyproject.toml`.
 # - `pull_request`: build both architectures and push nothing, so a `Dockerfile`
 #   change that breaks arm64 shows up here instead of in the next release. ⚠️ It is
 #   a signal, not a gate: nothing `needs:` this job and `ci-required` does not
-#   include it, so on its own it blocks no merge. It is also the only shape a fork
-#   can run, because nothing on that path needs a credential.
+#   include it, so on its own it blocks no merge -- recorded as one of exactly two
+#   such jobs in `JOBS_OUTSIDE_THE_REQUIRED_AGGREGATE`. It is also the only shape a
+#   fork can run, because nothing on that path needs a credential.
+#   ⚠️ Not a full rehearsal of publishing: `push:` is false here, so the
+#   attestation and cache-export paths below run only on the triggers above.
 # - `workflow_dispatch`: a manual rebuild, for a base image or OS package update
 #   that no commit here triggers. It builds with `no-cache:` for that reason -- the
 #   `apt-get` layer is keyed on the base image digest and the command, so a cached
@@ -93,6 +102,17 @@ jobs:
     # job use, and for the same reason: a safety net, not a budget. The arm64 half
     # runs under emulation, and a stuck build would otherwise hold a runner for six
     # hours.
+    #
+    # **Measured.** Not every cap here is -- `ci-required` declares 10 minutes on
+    # the reasoning that it starts a shell and exits -- but this is the
+    # repository's longest-running job by far, so a figure is worth more than an
+    # argument. Run 35434307949, the first on this branch: whole job 5m49s, the
+    # build step itself 5m26s, on a COLD cache with nothing to restore. The
+    # emulated arm64 leg dominates it: `apt-get install chromium` took ~20s on
+    # amd64 and ~2m30s on arm64. Roughly ten times the headroom, so the number is
+    # a safety net and not a bet. If a later run approaches it, the native
+    # `ubuntu-24.04-arm` shape weighed in the header is the trade to revisit,
+    # not this number.
     timeout-minutes: 60
     permissions:
       contents: read # actions/checkout
@@ -112,11 +132,20 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      # ⚠️ Skipped on pull requests, and that matters rather than being tidiness:
+      # 🔴 Skipped on pull requests, and that matters rather than being tidiness:
       # nothing is pushed on that path -- see `push:` on the build step -- so a login
-      # would authenticate for work that never happens. A pull request from a fork
-      # does get a `GITHUB_TOKEN`, but a read-only one, so `packages: write` is
-      # reduced to read and a push would fail whether or not the login ran.
+      # would authenticate for work that never happens.
+      #
+      # ⚠️ **The usual reassurance here is narrower than it reads.** A pull request
+      # from a FORK gets a read-only `GITHUB_TOKEN`, so `packages: write` is
+      # reduced to read and a push would fail whether or not the login ran. That is
+      # true, and it is not true of a pull request from a branch in this
+      # repository, which gets the declared `packages: write`. This repository
+      # takes both shapes. For the branch shape the `push:` expression below is the
+      # ONLY thing between a pull request and a publish, which is why
+      # `PublishConditionIsPairedTests` pairs these two lines rather than trusting
+      # them: `docker/build-push-action` defaults `push` to false, so deleting that
+      # line stops publishing silently and green.
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v4
@@ -135,6 +164,21 @@ jobs:
       # package as private even under a public repository. So after the first
       # successful run on `main`, someone has to change the package's visibility
       # once before `docker pull` works for anyone not logged in.
+      # 🔴 **The version is READ, never written here.** `pyproject.toml` is what
+      # `packaging.md` calls the published version, so a literal in this file
+      # would be a second place to bump and the one nobody remembers -- the
+      # package moves to 0.2.0 and the image keeps tagging 0.1.9. The emptiness
+      # check matters as much as the `sed`: without it a malformed file yields
+      # `version=`, and `metadata-action` is handed a tag with no value instead
+      # of the run going red. `VersionTagIsDerivedTests` executes this step
+      # against the real file rather than matching its text.
+      - name: Read the package version
+        id: version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml)"
+          test -n "$version" || { echo "pyproject.toml declares no version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@v6
@@ -144,6 +188,20 @@ jobs:
           # the action's default, which would also move it on a tag push.
           flavor: |
             latest=false
+          # ⚠️ **The last line is the version tag, and it MOVES.** Nothing in this
+          # repository produces a `v*` tag today -- there are no tags and no
+          # releases -- so the three `type=semver` lines have never fired, and
+          # without the last line the image would carry no version identity at
+          # all: a reader could not tell which package version a `:latest`
+          # contains. It names the newest default-branch build carrying that
+          # package version, so `:0.1.9` moves with every push to `main` until
+          # `pyproject.toml` changes. That is the deliberate trade -- the
+          # alternative, emitting it only on a `v*` tag, produces nothing until a
+          # release process exists. Immutability comes from the digest, which
+          # README documents beside the pull command.
+          #
+          # Comments live here rather than inside the block below: `tags: |` is a
+          # literal scalar, so a `#` line inside it is a tag pattern, not a note.
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -152,17 +210,37 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.version.outputs.version }},enable={{is_default_branch}}
 
       - name: Build and push image
         uses: docker/build-push-action@v7
         with:
           context: .
           # See the header before adding to this list: an architecture only works
-          # here if Debian ships a `chromium` for it.
+          # here if Debian ships a `chromium` for it. Pinned as a set by
+          # `PublishedPlatformsArePinnedTests`, which also holds README to naming
+          # the machines this actually builds for -- removing one is otherwise a
+          # change that goes green and is found by somebody whose `docker pull`
+          # reports no matching manifest.
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # 🔴 **Declared, because leaving it out does not mean "off".** With no
+          # `provenance:` input the action picks a default from the repository's
+          # visibility -- `mode=max` on a public repository, `mode=min,inline-only`
+          # on a private one (`docker/build-push-action`, `src/context.ts`,
+          # `getAttestArgs`). So this job was already publishing a full provenance
+          # attestation and nothing here said so; run 35434307949's build command
+          # carries `--attest type=provenance,mode=max`. The value is unchanged,
+          # but writing it out replaces a default CONDITIONAL on repository
+          # visibility with an unconditional decision -- this no longer changes
+          # meaning if the repository is ever made private. What it publishes
+          # beside the image: attestation manifests, which the GHCR package page
+          # renders as `unknown/unknown` rows next to the two real platforms, and
+          # the full build environment. `false` would give a two-entry manifest
+          # list matching README's promise exactly, at the cost of the attestation.
+          provenance: mode=max
           # A manual rebuild is the one run that must not reuse the `apt-get` layer;
           # see `workflow_dispatch` in the header.
           no-cache: ${{ github.event_name == 'workflow_dispatch' }}
@@ -173,4 +251,20 @@ jobs:
           # GitHub deletes caches "in order of last access date, from oldest to most
           # recent", so writing one cache per pull request costs the default branch's
           # older layers and buys almost nothing.
-          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max' || '' }}
+          #
+          # ⚠️ **`mode=min`, and that is paired with the `Dockerfile`.** `max`
+          # exports every intermediate layer, which earns its size only on a
+          # multi-stage build where those layers are discarded from the final
+          # image. `Dockerfile` declares ONE `FROM`, so every layer it builds --
+          # including the expensive `apt-get install chromium` and `pip install` --
+          # is already exported by `min`. Over a single stage the two cache the
+          # same work and `max` merely spends more of a 10 GB budget this workflow
+          # is the only consumer of, evicting its own older entries sooner. The day
+          # a second `FROM` lands, `min` starts costing real rebuild time and
+          # nothing here would look wrong, so `CacheModeMatchesTheBuildTests` makes
+          # the two files check each other.
+          #
+          # ⚠️ The first build after this lands is NOT a clean measurement of that
+          # trade: `cache-from` keeps reading the `mode=max` entries run
+          # 35434307949 already wrote, until they age out of the 10 GB.
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=min' || '' }}
